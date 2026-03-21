@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # =========================================================
-# Multi-Protocol Manager V3.1 (Fixed for Xray v26+)
+# Multi-Protocol Manager V3.2
 # =========================================================
 
 # --- 颜色定义 ---
@@ -9,7 +9,13 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
 NC='\033[0m'
+
+# --- 流量监控配置 ---
+TRAFFIC_CONF="/etc/vps-traffic.conf"
+DEFAULT_QUOTA_GB=2048  # 2TB
 
 # --- 路径定义 ---
 XRAY_BIN="/usr/local/bin/xray"
@@ -339,6 +345,232 @@ manage_snell_menu() {
     esac
 }
 
+# --- 5. 流量监控 ---
+
+_traffic_get_iface() {
+    ip route show default 2>/dev/null | awk '/^default/{print $5}' | head -1
+}
+
+_traffic_load_conf() {
+    QUOTA_GB=$DEFAULT_QUOTA_GB
+    RESET_DAY=1
+    ALERT_PCT=80
+    if [[ -f "$TRAFFIC_CONF" ]]; then
+        source "$TRAFFIC_CONF"
+    fi
+}
+
+_traffic_save_conf() {
+    cat > "$TRAFFIC_CONF" <<EOF
+QUOTA_GB=${QUOTA_GB}
+RESET_DAY=${RESET_DAY}
+ALERT_PCT=${ALERT_PCT}
+EOF
+}
+
+_traffic_install_vnstat() {
+    if ! command -v vnstat &>/dev/null; then
+        echo -e "${BLUE}正在安装 vnstat...${NC}"
+        if command -v apt &>/dev/null; then
+            apt install -y vnstat
+        elif command -v yum &>/dev/null; then
+            yum install -y vnstat
+        elif command -v dnf &>/dev/null; then
+            dnf install -y vnstat
+        fi
+        systemctl enable vnstat --now
+        local iface
+        iface=$(_traffic_get_iface)
+        if [[ -n "$iface" ]]; then
+            vnstat -i "$iface" --add 2>/dev/null || true
+        fi
+        echo -e "${YELLOW}vnstat 刚安装，需要收集约 1 分钟数据后才有统计。${NC}"
+        sleep 2
+    fi
+    # 确保 vnstat 服务在跑
+    systemctl is-active --quiet vnstat || systemctl start vnstat
+}
+
+_traffic_bytes_to_human() {
+    local bytes=$1
+    if (( bytes >= 1099511627776 )); then
+        awk "BEGIN {printf \"%.2f TB\", $bytes/1099511627776}"
+    elif (( bytes >= 1073741824 )); then
+        awk "BEGIN {printf \"%.2f GB\", $bytes/1073741824}"
+    elif (( bytes >= 1048576 )); then
+        awk "BEGIN {printf \"%.2f MB\", $bytes/1048576}"
+    else
+        echo "${bytes} B"
+    fi
+}
+
+_traffic_progress_bar() {
+    local pct=$1
+    local width=30
+    local filled=$(( pct * width / 100 ))
+    [[ $filled -gt $width ]] && filled=$width
+    local empty=$(( width - filled ))
+    local bar=""
+    for ((i=0; i<filled; i++)); do bar+="█"; done
+    for ((i=0; i<empty; i++)); do bar+="░"; done
+    if (( pct >= 90 )); then
+        echo -e "${RED}[${bar}] ${pct}%${NC}"
+    elif (( pct >= 70 )); then
+        echo -e "${YELLOW}[${bar}] ${pct}%${NC}"
+    else
+        echo -e "${GREEN}[${bar}] ${pct}%${NC}"
+    fi
+}
+
+traffic_show() {
+    _traffic_install_vnstat
+    _traffic_load_conf
+    local iface
+    iface=$(_traffic_get_iface)
+    if [[ -z "$iface" ]]; then
+        echo -e "${RED}无法检测网络接口${NC}"
+        return
+    fi
+
+    # 获取本月流量（bytes）
+    local rx_bytes tx_bytes total_bytes
+    rx_bytes=$(vnstat -i "$iface" --json m 2>/dev/null | \
+        python3 -c "import sys,json; d=json.load(sys.stdin)['interfaces'][0]['traffic']['month']; print(d[-1]['rx'])" 2>/dev/null || echo 0)
+    tx_bytes=$(vnstat -i "$iface" --json m 2>/dev/null | \
+        python3 -c "import sys,json; d=json.load(sys.stdin)['interfaces'][0]['traffic']['month']; print(d[-1]['tx'])" 2>/dev/null || echo 0)
+    total_bytes=$(( rx_bytes + tx_bytes ))
+
+    local quota_bytes=$(( QUOTA_GB * 1024 * 1024 * 1024 ))
+    local used_pct=0
+    if (( quota_bytes > 0 )); then
+        used_pct=$(( total_bytes * 100 / quota_bytes ))
+    fi
+    local remain_bytes=$(( quota_bytes - total_bytes ))
+    [[ $remain_bytes -lt 0 ]] && remain_bytes=0
+
+    # 今日流量
+    local today_rx today_tx
+    today_rx=$(vnstat -i "$iface" --json d 2>/dev/null | \
+        python3 -c "import sys,json; d=json.load(sys.stdin)['interfaces'][0]['traffic']['day']; print(d[-1]['rx'])" 2>/dev/null || echo 0)
+    today_tx=$(vnstat -i "$iface" --json d 2>/dev/null | \
+        python3 -c "import sys,json; d=json.load(sys.stdin)['interfaces'][0]['traffic']['day']; print(d[-1]['tx'])" 2>/dev/null || echo 0)
+    local today_total=$(( today_rx + today_tx ))
+
+    local reset_date
+    reset_date=$(date -d "$(date +%Y-%m)-${RESET_DAY}" +%Y-%m-%d 2>/dev/null || date +%Y-%m-%d)
+
+    echo -e "\n${BOLD}${BLUE}╔══════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}${BLUE}║           VPS 流量监控                   ║${NC}"
+    echo -e "${BOLD}${BLUE}╚══════════════════════════════════════════╝${NC}"
+    echo -e "  接口: ${CYAN}${iface}${NC}   重置日: 每月 ${RESET_DAY} 日"
+    echo ""
+    echo -e "  ${BOLD}本月用量${NC}"
+    echo -e "  ↑ 上传:   $(printf '%10s' "$(_traffic_bytes_to_human $tx_bytes)")"
+    echo -e "  ↓ 下载:   $(printf '%10s' "$(_traffic_bytes_to_human $rx_bytes)")"
+    echo -e "  ∑ 合计:   $(printf '%10s' "$(_traffic_bytes_to_human $total_bytes)")"
+    echo ""
+    echo -e "  ${BOLD}月配额: ${QUOTA_GB} GB${NC}  剩余: $(_traffic_bytes_to_human $remain_bytes)"
+    echo -n "  "
+    _traffic_progress_bar "$used_pct"
+    echo ""
+    echo -e "  ${BOLD}今日用量${NC}"
+    echo -e "  ↑ ${_traffic_bytes_to_human $today_tx}  ↓ ${_traffic_bytes_to_human $today_rx}  合计: $(_traffic_bytes_to_human $today_total)"
+    echo ""
+
+    if (( used_pct >= ALERT_PCT )); then
+        echo -e "  ${RED}⚠  已用 ${used_pct}%，超过告警阈值 ${ALERT_PCT}%！${NC}"
+    fi
+
+    echo -e "${BLUE}──────────────────────────────────────────${NC}"
+    echo -e "  ${YELLOW}最近 5 天明细:${NC}"
+    vnstat -i "$iface" -d 5 2>/dev/null | tail -8
+}
+
+traffic_show_month() {
+    _traffic_install_vnstat
+    local iface
+    iface=$(_traffic_get_iface)
+    echo -e "\n${YELLOW}=== 历史月度流量 ===${NC}"
+    vnstat -i "$iface" -m 2>/dev/null
+}
+
+traffic_set_quota() {
+    _traffic_load_conf
+    echo -e "\n${YELLOW}=== 配置流量配额 ===${NC}"
+    echo -e "当前配额: ${QUOTA_GB} GB，告警阈值: ${ALERT_PCT}%，重置日: 每月 ${RESET_DAY} 日"
+    echo ""
+    read -p "月配额 (GB) [当前: ${QUOTA_GB}, 回车跳过]: " input
+    [[ -n "$input" ]] && QUOTA_GB="$input"
+    read -p "重置日 (1-28) [当前: ${RESET_DAY}, 回车跳过]: " input
+    [[ -n "$input" ]] && RESET_DAY="$input"
+    read -p "告警阈值 % [当前: ${ALERT_PCT}, 回车跳过]: " input
+    [[ -n "$input" ]] && ALERT_PCT="$input"
+    _traffic_save_conf
+    echo -e "${GREEN}已保存。${NC}"
+}
+
+traffic_setup_cron() {
+    _traffic_load_conf
+    local iface
+    iface=$(_traffic_get_iface)
+    local cron_script="/usr/local/bin/vps-traffic-alert.sh"
+    cat > "$cron_script" <<SCRIPT
+#!/bin/bash
+IFACE="$iface"
+QUOTA_BYTES=$(( QUOTA_GB * 1024 * 1024 * 1024 ))
+ALERT_PCT=$ALERT_PCT
+
+rx=\$(vnstat -i "\$IFACE" --json m 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin)['interfaces'][0]['traffic']['month']; print(d[-1]['rx'])" 2>/dev/null || echo 0)
+tx=\$(vnstat -i "\$IFACE" --json m 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin)['interfaces'][0]['traffic']['month']; print(d[-1]['tx'])" 2>/dev/null || echo 0)
+total=\$(( rx + tx ))
+pct=\$(( total * 100 / QUOTA_BYTES ))
+
+if (( pct >= ALERT_PCT )); then
+    wall "⚠ VPS 流量告警：本月已用 \${pct}% (\$(numfmt --to=iec \$total) / ${QUOTA_GB}GB)"
+    logger -t vps-traffic "ALERT: used \${pct}% of monthly quota"
+fi
+SCRIPT
+    chmod +x "$cron_script"
+
+    # 每小时检查一次
+    local cron_line="0 * * * * $cron_script"
+    if crontab -l 2>/dev/null | grep -qF "$cron_script"; then
+        echo -e "${YELLOW}定时告警已存在，已更新脚本。${NC}"
+    else
+        ( crontab -l 2>/dev/null; echo "$cron_line" ) | crontab -
+        echo -e "${GREEN}已设置每小时检查，超过 ${ALERT_PCT}% 时写入系统日志并广播告警。${NC}"
+    fi
+}
+
+traffic_remove_cron() {
+    local cron_script="/usr/local/bin/vps-traffic-alert.sh"
+    crontab -l 2>/dev/null | grep -v "$cron_script" | crontab -
+    rm -f "$cron_script"
+    echo -e "${GREEN}已移除定时告警。${NC}"
+}
+
+manage_traffic_menu() {
+    while true; do
+        echo -e "\n${BLUE}--- 流量监控 ---${NC}"
+        echo "1. 查看本月流量"
+        echo "2. 查看历史月度流量"
+        echo "3. 设置配额与告警阈值"
+        echo "4. 开启每小时自动告警 (cron)"
+        echo "5. 关闭自动告警"
+        echo "0. 返回主菜单"
+        read -p "请选择: " OPT
+        case $OPT in
+            1) traffic_show ;;
+            2) traffic_show_month ;;
+            3) traffic_set_quota ;;
+            4) traffic_setup_cron ;;
+            5) traffic_remove_cron ;;
+            0) break ;;
+            *) echo "无效选择" ;;
+        esac
+    done
+}
+
 # --- 4. BBR 管理 ---
 
 enable_bbr() {
@@ -360,7 +592,7 @@ main_menu() {
     while true; do
         clear
         echo -e "${BLUE}=====================================${NC}"
-        echo -e "   全能协议管理脚本 V3.1 (Fix Xray v26)"
+        echo -e "   全能协议管理脚本 V3.2"
         echo -e "${BLUE}=====================================${NC}"
         echo -e "1. 安装/重置 Reality (TCP 443)  [$(check_status xray)]"
         echo -e "2. 安装/重置 Hysteria2 (UDP 443)[$(check_status hysteria-server)]"
@@ -371,10 +603,11 @@ main_menu() {
         echo -e "6. 管理 Snell"
         echo -e "-------------------------------------"
         echo -e "7. 开启 BBR 加速"
+        echo -e "8. 流量监控"
         echo -e "0. 退出脚本"
         echo -e "${BLUE}=====================================${NC}"
         read -p "请输入选项: " CHOICE
-        
+
         case $CHOICE in
             1) install_reality; read -p "按回车继续..." ;;
             2) install_hy2; read -p "按回车继续..." ;;
@@ -383,6 +616,7 @@ main_menu() {
             5) manage_hy2_menu; read -p "按回车继续..." ;;
             6) manage_snell_menu; read -p "按回车继续..." ;;
             7) enable_bbr; read -p "按回车继续..." ;;
+            8) manage_traffic_menu ;;
             0) exit 0 ;;
             *) echo "无效选项"; sleep 1 ;;
         esac
