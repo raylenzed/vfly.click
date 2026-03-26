@@ -101,9 +101,26 @@ install_reality() {
     UUID=$($XRAY_BIN uuid)
     SID=$(openssl rand -hex 4)
 
+    mkdir -p /var/log/xray
+    touch /var/log/xray/access.log
+    chown nobody:nogroup /var/log/xray/access.log 2>/dev/null || true
+
     cat > $XRAY_CONF <<EOF
 {
-  "log": { "loglevel": "warning" },
+  "log": { "access": "/var/log/xray/access.log", "loglevel": "warning" },
+  "stats": {},
+  "api": {
+    "tag": "api",
+    "services": ["StatsService"]
+  },
+  "policy": {
+    "system": {
+      "statsInboundUplink": true,
+      "statsInboundDownlink": true,
+      "statsOutboundUplink": true,
+      "statsOutboundDownlink": true
+    }
+  },
   "inbounds": [
     {
       "port": 443,
@@ -128,12 +145,24 @@ install_reality() {
         "enabled": true,
         "destOverride": ["http", "tls"]
       }
+    },
+    {
+      "tag": "api",
+      "listen": "127.0.0.1",
+      "port": 10085,
+      "protocol": "dokodemo-door",
+      "settings": { "address": "127.0.0.1" }
     }
   ],
   "outbounds": [
     { "protocol": "freedom", "tag": "direct" },
     { "protocol": "blackhole", "tag": "blocked" }
-  ]
+  ],
+  "routing": {
+    "rules": [
+      { "inboundTag": ["api"], "outboundTag": "api" }
+    ]
+  }
 }
 EOF
     # 保存公钥到文件以便后续查看
