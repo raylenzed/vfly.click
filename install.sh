@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # =========================================================
-# VFly - Multi-Protocol Manager V3.3
+# VFly - Multi-Protocol Manager V3.4
 # =========================================================
 
 # --- 颜色定义 ---
@@ -89,7 +89,7 @@ get_ip() {
 }
 
 check_status() {
-    if systemctl is-active --quiet $1; then
+    if systemctl is-active --quiet "$1"; then
         echo -e "${GREEN}运行中${NC}"
     else
         echo -e "${RED}未运行${NC}"
@@ -100,8 +100,11 @@ check_status() {
 
 install_reality() {
     echo -e "${BLUE}>>> 安装/重置 Xray Reality...${NC}"
-    bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
-    
+    if ! bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install; then
+        echo -e "${RED}Xray 安装失败，请检查网络或稍后重试。${NC}"
+        return 1
+    fi
+
     mkdir -p /usr/local/etc/xray
     
     select_port "VLESS Reality"
@@ -109,8 +112,15 @@ install_reality() {
     echo -e "${YELLOW}提示：443 端口让流量看起来像正常 HTTPS，隐蔽性最好；${NC}"
     echo -e "${YELLOW}      其他端口功能完全正常，但可能更容易被识别为代理流量。${NC}"
 
-    read -p "请输入伪装域名 (SNI) [默认: griffithobservatory.org]: " SNI
-    [[ -z "$SNI" ]] && SNI="griffithobservatory.org"
+    while true; do
+        read -p "请输入伪装域名 (SNI) [默认: griffithobservatory.org]: " SNI
+        [[ -z "$SNI" ]] && SNI="griffithobservatory.org"
+        if [[ "$SNI" =~ ^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*$ ]]; then
+            break
+        else
+            echo -e "${RED}无效域名格式，请重新输入（只允许字母、数字、点、连字符）${NC}"
+        fi
+    done
 
     echo -e "${YELLOW}正在生成密钥...${NC}"
     
@@ -180,7 +190,7 @@ install_reality() {
         "network": "tcp",
         "security": "reality",
         "realitySettings": {
-          "dest": "$SNI:$SELECTED_PORT",
+          "dest": "$SNI:443",
           "serverNames": ["$SNI"],
           "privateKey": "$PK",
           "shortIds": ["$SID"]
@@ -213,7 +223,10 @@ EOF
     # 保存公钥到文件以便后续查看
     echo "$PUB" > /usr/local/etc/xray/public.key
 
-    systemctl restart xray
+    if ! systemctl restart xray; then
+        echo -e "${RED}Xray 服务启动失败，请查看日志: journalctl -u xray -n 20${NC}"
+        return 1
+    fi
     echo -e "${GREEN}Reality 安装完成！${NC}"
     view_reality
 }
@@ -274,7 +287,10 @@ install_hy2() {
         *) echo "不支持架构"; return ;;
     esac
     LATEST=$(curl -s https://api.github.com/repos/apernet/hysteria/releases/latest | grep "tag_name" | cut -d '"' -f 4)
-    wget -O /usr/local/bin/hysteria_server "https://github.com/apernet/hysteria/releases/download/${LATEST}/hysteria-linux-${HY_ARCH}"
+    if ! wget -O /usr/local/bin/hysteria_server "https://github.com/apernet/hysteria/releases/download/${LATEST}/hysteria-linux-${HY_ARCH}"; then
+        echo -e "${RED}Hysteria 2 下载失败，请检查网络或稍后重试。${NC}"
+        return 1
+    fi
     chmod +x /usr/local/bin/hysteria_server
 
     select_port "Hysteria 2 (UDP)"
@@ -294,6 +310,10 @@ auth:
 ignoreClientBandwidth: false
 EOF
     
+    local HY_GROUP="nobody"
+    grep -q "nogroup" /etc/group && HY_GROUP="nogroup"
+    chown -R nobody:"$HY_GROUP" /etc/hysteria
+
     cat > /etc/systemd/system/hysteria-server.service <<EOF
 [Unit]
 Description=Hysteria 2 Server
@@ -302,14 +322,19 @@ After=network.target
 Type=simple
 ExecStart=/usr/local/bin/hysteria_server server -c /etc/hysteria/config.yaml
 Restart=always
-User=root
+User=nobody
+Group=${HY_GROUP}
+AmbientCapabilities=CAP_NET_BIND_SERVICE
 LimitNOFILE=65535
 [Install]
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
     systemctl enable hysteria-server
-    systemctl restart hysteria-server
+    if ! systemctl restart hysteria-server; then
+        echo -e "${RED}Hysteria 2 服务启动失败，请查看日志: journalctl -u hysteria-server -n 20${NC}"
+        return 1
+    fi
     echo -e "${GREEN}Hysteria 2 安装完成！${NC}"
     view_hy2
 }
@@ -352,12 +377,20 @@ manage_hy2_menu() {
 install_snell() {
     echo -e "${BLUE}>>> 安装 Snell v5...${NC}"
     ARCH=$(uname -m)
+    # 尝试动态获取最新版本号，失败时回退到已知稳定版本
+    local SNELL_VER
+    SNELL_VER=$(curl -fsSm5 https://dl.nssurge.com/snell/snell-server-latest-version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    [[ -z "$SNELL_VER" ]] && SNELL_VER="v5.0.1"
+    echo -e "${YELLOW}Snell 版本: ${SNELL_VER}${NC}"
     if [[ "$ARCH" == "x86_64" ]]; then
-        URL="https://dl.nssurge.com/snell/snell-server-v5.0.1-linux-amd64.zip"
+        URL="https://dl.nssurge.com/snell/snell-server-${SNELL_VER}-linux-amd64.zip"
     else
-        URL="https://dl.nssurge.com/snell/snell-server-v5.0.1-linux-aarch64.zip"
+        URL="https://dl.nssurge.com/snell/snell-server-${SNELL_VER}-linux-aarch64.zip"
     fi
-    wget -O snell.zip "$URL"
+    if ! wget -O snell.zip "$URL"; then
+        echo -e "${RED}Snell 下载失败，请检查网络或稍后重试。${NC}"
+        return 1
+    fi
     unzip -o snell.zip -d /usr/local/bin
     rm snell.zip
     chmod +x /usr/local/bin/snell-server
@@ -394,7 +427,10 @@ WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
     systemctl enable snell
-    systemctl restart snell
+    if ! systemctl restart snell; then
+        echo -e "${RED}Snell 服务启动失败，请查看日志: journalctl -u snell -n 20${NC}"
+        return 1
+    fi
     echo -e "${GREEN}Snell 安装完成！${NC}"
     view_snell
 }
@@ -438,8 +474,20 @@ _traffic_load_conf() {
     QUOTA_GB=$DEFAULT_QUOTA_GB
     RESET_DAY=1
     ALERT_PCT=80
+    WEB_TOKEN=""
+    WEB_PORT=""
     if [[ -f "$TRAFFIC_CONF" ]]; then
-        source "$TRAFFIC_CONF"
+        local _val
+        _val=$(grep -m1 '^QUOTA_GB=' "$TRAFFIC_CONF" | cut -d'=' -f2-)
+        [[ "$_val" =~ ^[0-9]+$ ]] && QUOTA_GB="$_val"
+        _val=$(grep -m1 '^RESET_DAY=' "$TRAFFIC_CONF" | cut -d'=' -f2-)
+        [[ "$_val" =~ ^[0-9]+$ ]] && RESET_DAY="$_val"
+        _val=$(grep -m1 '^ALERT_PCT=' "$TRAFFIC_CONF" | cut -d'=' -f2-)
+        [[ "$_val" =~ ^[0-9]+$ ]] && ALERT_PCT="$_val"
+        _val=$(grep -m1 '^WEB_TOKEN=' "$TRAFFIC_CONF" | cut -d'=' -f2-)
+        [[ -n "$_val" ]] && WEB_TOKEN="$_val"
+        _val=$(grep -m1 '^WEB_PORT=' "$TRAFFIC_CONF" | cut -d'=' -f2-)
+        [[ "$_val" =~ ^[0-9]+$ ]] && WEB_PORT="$_val"
     fi
 }
 
@@ -583,11 +631,29 @@ traffic_set_quota() {
     echo -e "当前配额: ${QUOTA_GB} GB，告警阈值: ${ALERT_PCT}%，重置日: 每月 ${RESET_DAY} 日"
     echo ""
     read -p "月配额 (GB) [当前: ${QUOTA_GB}, 回车跳过]: " input
-    [[ -n "$input" ]] && QUOTA_GB="$input"
+    if [[ -n "$input" ]]; then
+        if [[ "$input" =~ ^[0-9]+$ ]] && (( input >= 1 && input <= 102400 )); then
+            QUOTA_GB="$input"
+        else
+            echo -e "${YELLOW}无效值，保持当前配额 ${QUOTA_GB} GB${NC}"
+        fi
+    fi
     read -p "重置日 (1-28) [当前: ${RESET_DAY}, 回车跳过]: " input
-    [[ -n "$input" ]] && RESET_DAY="$input"
+    if [[ -n "$input" ]]; then
+        if [[ "$input" =~ ^[0-9]+$ ]] && (( input >= 1 && input <= 28 )); then
+            RESET_DAY="$input"
+        else
+            echo -e "${YELLOW}无效值，保持当前重置日 ${RESET_DAY}${NC}"
+        fi
+    fi
     read -p "告警阈值 % [当前: ${ALERT_PCT}, 回车跳过]: " input
-    [[ -n "$input" ]] && ALERT_PCT="$input"
+    if [[ -n "$input" ]]; then
+        if [[ "$input" =~ ^[0-9]+$ ]] && (( input >= 1 && input <= 100 )); then
+            ALERT_PCT="$input"
+        else
+            echo -e "${YELLOW}无效值，保持当前阈值 ${ALERT_PCT}%${NC}"
+        fi
+    fi
     _traffic_save_conf
     echo -e "${GREEN}已保存。${NC}"
 }
@@ -658,11 +724,17 @@ manage_traffic_menu() {
 
 enable_bbr() {
     echo -e "${BLUE}>>> 开启 BBR 加速...${NC}"
-    if grep -q "bbr" /etc/sysctl.conf; then
-        echo -e "${GREEN}BBR 似乎已经开启，正在刷新...${NC}"
-    else
+    local changed=0
+    if ! grep -q "^net.core.default_qdisc=fq" /etc/sysctl.conf; then
         echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
+        changed=1
+    fi
+    if ! grep -q "^net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.conf; then
         echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+        changed=1
+    fi
+    if (( changed == 0 )); then
+        echo -e "${GREEN}BBR 配置已存在，正在刷新...${NC}"
     fi
     sysctl -p
     RESULT=$(sysctl net.ipv4.tcp_congestion_control)
@@ -873,7 +945,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
         remain = max(quota_bytes - total, 0)
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         data = {
             "iface": IFACE, "rx": rx, "tx": tx,
@@ -1006,7 +1077,7 @@ main_menu() {
     while true; do
         clear
         echo -e "${BLUE}=====================================${NC}"
-        echo -e "   全能协议管理脚本 V3.3"
+        echo -e "   全能协议管理脚本 V3.4"
         echo -e "${BLUE}=====================================${NC}"
         echo -e "1. 安装/重置 Reality (TCP 443)  [$(check_status xray)]"
         echo -e "2. 安装/重置 Hysteria2 (UDP 443)[$(check_status hysteria-server)]"
