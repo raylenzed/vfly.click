@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # =========================================================
-# VFly - Multi-Protocol Manager V3.4
+# VFly - Multi-Protocol Manager V3.5
 # =========================================================
 
 # --- 颜色定义 ---
@@ -162,7 +162,7 @@ install_reality() {
 
     cat > $XRAY_CONF <<EOF
 {
-  "log": { "access": "/var/log/xray/access.log", "loglevel": "warning" },
+  "log": { "access": "/var/log/xray/access.log", "loglevel": "info" },
   "stats": {},
   "api": {
     "tag": "api",
@@ -499,6 +499,20 @@ ALERT_PCT=${ALERT_PCT}
 EOF
 }
 
+_traffic_setup_logrotate() {
+    cat > /etc/logrotate.d/xray <<'EOF'
+/var/log/xray/access.log {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
+EOF
+}
+
 _traffic_install_vnstat() {
     if ! command -v vnstat &>/dev/null; then
         echo -e "${BLUE}正在安装 vnstat...${NC}"
@@ -520,6 +534,72 @@ _traffic_install_vnstat() {
     fi
     # 确保 vnstat 服务在跑
     systemctl is-active --quiet vnstat || systemctl start vnstat
+}
+
+_traffic_install_conntrack() {
+    if ! command -v conntrack &>/dev/null; then
+        echo -e "${BLUE}正在安装 conntrack...${NC}"
+        if command -v apt &>/dev/null; then
+            apt install -y conntrack
+        elif command -v yum &>/dev/null; then
+            yum install -y conntrack-tools
+        elif command -v dnf &>/dev/null; then
+            dnf install -y conntrack-tools
+        fi
+    fi
+    # 检查内核是否支持 conntrack
+    if ! modinfo nf_conntrack &>/dev/null && ! lsmod | grep -q nf_conntrack; then
+        echo -e "${RED}此系统内核不支持 nf_conntrack（可能是 OpenVZ/LXC），无法启用连接追踪。${NC}"
+        return 1
+    fi
+    # 启用 conntrack 计数（默认关闭）
+    sysctl -w net.netfilter.nf_conntrack_acct=1 &>/dev/null || true
+    if ! grep -q "^net.netfilter.nf_conntrack_acct" /etc/sysctl.d/99-conntrack.conf 2>/dev/null; then
+        echo "net.netfilter.nf_conntrack_acct=1" > /etc/sysctl.d/99-conntrack.conf
+    fi
+    echo -e "${GREEN}conntrack 就绪。${NC}"
+}
+
+_traffic_install_geoip() {
+    local geoip_dir="/opt/vps-traffic-web/geoip"
+    mkdir -p "$geoip_dir"
+    echo -e "${BLUE}正在下载 GeoLite2-Country.mmdb...${NC}"
+    local url="https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-Country.mmdb"
+    if ! wget -qO "$geoip_dir/GeoLite2-Country.mmdb" "$url"; then
+        echo -e "${RED}GeoIP 数据库下载失败，将跳过国家显示。${NC}"
+        return 1
+    fi
+    # 安装 maxminddb python 库
+    if ! python3 -c "import maxminddb" &>/dev/null; then
+        pip3 install maxminddb --quiet 2>/dev/null || \
+        pip install maxminddb --quiet 2>/dev/null || \
+        echo -e "${YELLOW}maxminddb 安装失败，国家显示将不可用。${NC}"
+    fi
+    echo -e "${GREEN}GeoIP 数据库就绪: $geoip_dir/GeoLite2-Country.mmdb${NC}"
+}
+
+_traffic_update_geoip() {
+    echo -e "${YELLOW}正在更新 GeoIP 数据库...${NC}"
+    _traffic_install_geoip
+    # 重启采集器以加载新数据库
+    systemctl is-active --quiet vps-traffic-collector && systemctl restart vps-traffic-collector
+    echo -e "${GREEN}GeoIP 更新完成。${NC}"
+}
+
+_traffic_flows_cleanup_cron() {
+    local cron_script="/usr/local/bin/vps-flows-cleanup.sh"
+    cat > "$cron_script" <<'SCRIPT'
+#!/bin/bash
+DB="/var/lib/vps-traffic/flows.db"
+[[ -f "$DB" ]] || exit 0
+sqlite3 "$DB" "DELETE FROM flows WHERE ts < strftime('%s','now','-6 months'); VACUUM;" 2>/dev/null
+logger -t vps-flows "cleanup: removed flows older than 6 months"
+SCRIPT
+    chmod +x "$cron_script"
+    local cron_line="0 3 * * * $cron_script"
+    if ! crontab -l 2>/dev/null | grep -qF "$cron_script"; then
+        ( crontab -l 2>/dev/null; echo "$cron_line" ) | crontab -
+    fi
 }
 
 _traffic_bytes_to_human() {
@@ -743,6 +823,303 @@ enable_bbr() {
 
 # --- 6. Web 流量面板 ---
 
+_traffic_install_collector() {
+    local iface="$1"
+    mkdir -p /var/lib/vps-traffic
+    mkdir -p /opt/vps-traffic-web
+
+    cat > /opt/vps-traffic-web/collector.py <<'PYEOF'
+#!/usr/bin/env python3
+"""
+VPS 流量采集器 - 双数据源：Xray access.log + conntrack -E
+"""
+import re, socket, subprocess, sqlite3, time, threading, json, os, logging
+from collections import OrderedDict
+
+DB_PATH    = "/var/lib/vps-traffic/flows.db"
+XRAY_LOG   = "/var/log/xray/access.log"
+GEOIP_PATH = "/opt/vps-traffic-web/geoip/GeoLite2-Country.mmdb"
+FILTER_PORTS = {22, 53}          # 过滤 SSH 和 DNS 噪音
+MATCH_WINDOW = 60                # Xray log 与 conntrack 匹配时间窗（秒）
+BATCH_INTERVAL = 5               # 批量写库间隔（秒）
+RDNS_TTL   = 86400               # rDNS 缓存 TTL（秒）
+RDNS_RATE  = 10                  # rDNS 每秒最多查询次数
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("collector")
+
+# ---- GeoIP ----
+try:
+    import maxminddb
+    _geo_db = maxminddb.open_database(GEOIP_PATH)
+    def geoip(ip):
+        try:
+            r = _geo_db.get(ip)
+            return r["country"]["iso_code"] if r else None
+        except Exception:
+            return None
+except Exception:
+    def geoip(ip): return None
+    log.warning("maxminddb 未安装或 GeoIP 数据库不存在，国家字段将为空")
+
+# ---- 获取本机 IP 列表 ----
+def get_local_ips():
+    try:
+        out = subprocess.check_output(["ip", "-j", "addr"], text=True)
+        data = json.loads(out)
+        ips = set()
+        for iface in data:
+            for addr in iface.get("addr_info", []):
+                ips.add(addr["local"])
+        return ips
+    except Exception:
+        return {"127.0.0.1"}
+
+LOCAL_IPS = get_local_ips()
+
+# ---- rDNS 缓存 ----
+_rdns_mem = OrderedDict()
+_rdns_lock = threading.Lock()
+_rdns_sem = threading.Semaphore(RDNS_RATE)
+
+def rdns_lookup(ip):
+    now = int(time.time())
+    with _rdns_lock:
+        if ip in _rdns_mem:
+            host, ts = _rdns_mem[ip]
+            if now - ts < RDNS_TTL:
+                return host
+    # 检查 SQLite 缓存
+    try:
+        with sqlite3.connect(DB_PATH, timeout=10) as conn:
+            row = conn.execute("SELECT host, updated FROM rdns_cache WHERE ip=?", (ip,)).fetchone()
+            if row and now - row[1] < RDNS_TTL:
+                with _rdns_lock:
+                    _rdns_mem[ip] = (row[0], row[1])
+                return row[0]
+    except Exception:
+        pass
+    # 实际查询
+    with _rdns_sem:
+        try:
+            host = socket.gethostbyaddr(ip)[0]
+        except Exception:
+            host = None
+    # 写缓存
+    try:
+        with sqlite3.connect(DB_PATH, timeout=10) as conn:
+            conn.execute("INSERT OR REPLACE INTO rdns_cache VALUES (?,?,?)", (ip, host, now))
+    except Exception:
+        pass
+    with _rdns_lock:
+        _rdns_mem[ip] = (host, now)
+        if len(_rdns_mem) > 5000:
+            _rdns_mem.popitem(last=False)
+    return host
+
+# ---- SQLite 初始化 ----
+def init_db():
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.executescript("""
+PRAGMA journal_mode=WAL;
+CREATE TABLE IF NOT EXISTS flows (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts         INTEGER NOT NULL,
+  proto      TEXT,
+  direction  TEXT,
+  src_ip     TEXT, src_port INTEGER,
+  dst_ip     TEXT, dst_port INTEGER,
+  bytes_up   INTEGER,
+  bytes_down INTEGER,
+  country    TEXT,
+  host       TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_flows_ts      ON flows(ts);
+CREATE INDEX IF NOT EXISTS idx_flows_country ON flows(country);
+CREATE INDEX IF NOT EXISTS idx_flows_dst_ip  ON flows(dst_ip);
+CREATE INDEX IF NOT EXISTS idx_flows_src_ip  ON flows(src_ip);
+CREATE TABLE IF NOT EXISTS rdns_cache (
+  ip      TEXT PRIMARY KEY,
+  host    TEXT,
+  updated INTEGER
+);
+""")
+
+# ---- 批量写队列 ----
+_write_queue = []
+_write_lock  = threading.Lock()
+
+def enqueue(row):
+    with _write_lock:
+        _write_queue.append(row)
+
+def flush_writer():
+    while True:
+        time.sleep(BATCH_INTERVAL)
+        with _write_lock:
+            if not _write_queue:
+                continue
+            batch = _write_queue[:]
+            _write_queue.clear()
+        try:
+            with sqlite3.connect(DB_PATH, timeout=30) as conn:
+                conn.executemany(
+                    "INSERT INTO flows (ts,proto,direction,src_ip,src_port,dst_ip,dst_port,bytes_up,bytes_down,country,host) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)", batch)
+        except Exception as e:
+            log.error("DB write error: %s", e)
+
+# ---- Xray 日志解析 ----
+# 格式: 2024/01/01 12:34:56 from 1.2.3.4:54321 accepted tcp:www.youtube.com:443 [tag -> direct]
+_xray_re = re.compile(
+    r"(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}) from ([\d.a-fA-F:]+):(\d+) accepted \w+:([\w\.\-\[\]:]+):(\d+)"
+)
+# 挂起的 Xray 事件，等待 conntrack 提供字节数
+# key: (src_ip, src_port, dst_port)  value: [ts, direction, src_ip, src_port, dst_ip, dst_port, country, host, expire_time]
+_xray_pending = {}
+_xray_lock = threading.Lock()
+
+def xray_log_reader():
+    """tail -F Xray access.log，逐行解析"""
+    while True:
+        try:
+            proc = subprocess.Popen(["tail", "-F", "-n", "0", XRAY_LOG],
+                                    stdout=subprocess.PIPE, text=True)
+            for line in proc.stdout:
+                m = _xray_re.search(line)
+                if not m:
+                    continue
+                ts_str, src_ip, src_port_s, dst_host, dst_port_s = m.groups()
+                src_port = int(src_port_s)
+                dst_port = int(dst_port_s)
+                if dst_port in FILTER_PORTS:
+                    continue
+                ts = int(time.mktime(time.strptime(ts_str, "%Y/%m/%d %H:%M:%S")))
+                # 方向：入站（客户端 -> 本机）
+                direction = "in"
+                peer_ip = src_ip
+                country = geoip(peer_ip)
+                # dst_host 可能是域名或 IP
+                host = dst_host if not dst_host.replace(".", "").isdigit() else None
+                dst_ip = dst_host if dst_host.replace(".", "").isdigit() else None
+                key = (src_ip, src_port, dst_port)
+                expire = time.time() + MATCH_WINDOW
+                with _xray_lock:
+                    _xray_pending[key] = [ts, "in", src_ip, src_port,
+                                          dst_ip or "", dst_port,
+                                          country, host or dst_host, expire]
+        except Exception as e:
+            log.warning("xray_log_reader error: %s", e)
+            time.sleep(5)
+
+def xray_pending_reaper():
+    """定期将超时未匹配的 Xray 事件直接写库（bytes=NULL）"""
+    while True:
+        time.sleep(10)
+        now = time.time()
+        expired = []
+        with _xray_lock:
+            for key, val in list(_xray_pending.items()):
+                if now > val[8]:
+                    expired.append((key, val))
+                    del _xray_pending[key]
+        for key, val in expired:
+            ts, direction, src_ip, src_port, dst_ip, dst_port, country, host, _ = val
+            enqueue((ts, "tcp", direction, src_ip, src_port, dst_ip, dst_port, None, None, country, host))
+
+# ---- conntrack 解析 ----
+# 格式(DESTROY): [时间戳] tcp src=1.2.3.4 dst=5.6.7.8 sport=54321 dport=443 ... bytes=1234 ...
+_ct_re = re.compile(
+    r"\[(\d+\.\d+)\].*?(\w+)\s+\d+\s+\d+.*?src=([\d.a-fA-F:]+)\s+dst=([\d.a-fA-F:]+)\s+sport=(\d+)\s+dport=(\d+)"
+    r".*?bytes=(\d+).*?bytes=(\d+)"
+)
+
+def conntrack_reader():
+    """conntrack -E -o timestamp -e DESTROY 逐行解析，与 Xray pending 合并"""
+    while True:
+        try:
+            proc = subprocess.Popen(
+                ["conntrack", "-E", "-o", "timestamp", "-e", "DESTROY"],
+                stdout=subprocess.PIPE, text=True)
+            for line in proc.stdout:
+                m = _ct_re.search(line)
+                if not m:
+                    continue
+                ts_f, proto, src_ip, dst_ip, sport_s, dport_s, bytes1_s, bytes2_s = m.groups()
+                ts = int(float(ts_f))
+                src_port = int(sport_s)
+                dst_port = int(dport_s)
+                bytes1 = int(bytes1_s)
+                bytes2 = int(bytes2_s)
+                if dst_port in FILTER_PORTS or src_port in FILTER_PORTS:
+                    continue
+                # 判断方向
+                if dst_ip in LOCAL_IPS:
+                    direction = "in"
+                    peer_ip = src_ip
+                    bytes_up, bytes_down = bytes1, bytes2
+                else:
+                    direction = "out"
+                    peer_ip = dst_ip
+                    bytes_up, bytes_down = bytes1, bytes2
+                # 尝试匹配 Xray pending
+                key = (src_ip, src_port, dst_port)
+                matched = None
+                with _xray_lock:
+                    if key in _xray_pending:
+                        matched = _xray_pending.pop(key)
+                if matched:
+                    _, _, _, _, xdst_ip, _, country, host, _ = matched
+                    enqueue((ts, proto, direction, src_ip, src_port,
+                             xdst_ip or dst_ip, dst_port,
+                             bytes_up, bytes_down, country, host))
+                else:
+                    country = geoip(peer_ip)
+                    # 非 Xray 流量，尝试 rDNS（后台线程）
+                    def do_rdns(ts=ts, proto=proto, direction=direction,
+                                src_ip=src_ip, src_port=src_port, dst_ip=dst_ip, dst_port=dst_port,
+                                bytes_up=bytes_up, bytes_down=bytes_down, country=country, peer_ip=peer_ip):
+                        host = rdns_lookup(peer_ip)
+                        enqueue((ts, proto, direction, src_ip, src_port, dst_ip, dst_port,
+                                 bytes_up, bytes_down, country, host))
+                    threading.Thread(target=do_rdns, daemon=True).start()
+        except Exception as e:
+            log.warning("conntrack_reader error: %s", e)
+            time.sleep(5)
+
+if __name__ == "__main__":
+    init_db()
+    log.info("VPS 流量采集器启动 (DB: %s)", DB_PATH)
+    threading.Thread(target=flush_writer, daemon=True).start()
+    threading.Thread(target=xray_log_reader, daemon=True).start()
+    threading.Thread(target=xray_pending_reaper, daemon=True).start()
+    conntrack_reader()  # 主线程跑 conntrack
+PYEOF
+
+    cat > /etc/systemd/system/vps-traffic-collector.service <<EOF
+[Unit]
+Description=VPS Traffic Collector (conntrack + Xray log)
+After=network.target xray.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/vps-traffic-web/collector.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable vps-traffic-collector
+    if ! systemctl restart vps-traffic-collector; then
+        echo -e "${RED}采集器启动失败，请查看日志: journalctl -u vps-traffic-collector -n 30${NC}"
+        return 1
+    fi
+    echo -e "${GREEN}流量采集器已启动。${NC}"
+}
+
 _web_write_server() {
     local iface="$1" quota_gb="$2" reset_day="$3" alert_pct="$4" token="$5"
     mkdir -p "$TRAFFIC_WEB_DIR"
@@ -908,52 +1285,421 @@ setInterval(load,60000);
 </body></html>
 """
 
+DB_PATH = "/var/lib/vps-traffic/flows.db"
+
+RANGE_MAP = {
+    "today": "strftime('%s','now','start of day')",
+    "7d":    "strftime('%s','now','-7 days')",
+    "30d":   "strftime('%s','now','-30 days')",
+    "6m":    "strftime('%s','now','-6 months')",
+}
+
+def db_conn():
+    import sqlite3
+    if not os.path.exists(DB_PATH):
+        return None
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=5)
+        conn.row_factory = sqlite3.Row
+        return conn
+    except Exception:
+        return None
+
+def flows_summary(range_key="7d", direction=None):
+    since_expr = RANGE_MAP.get(range_key, RANGE_MAP["7d"])
+    conn = db_conn()
+    if not conn:
+        return {"connections": 0, "bytes_up": 0, "bytes_down": 0}
+    dir_clause = f"AND direction='{direction}'" if direction else ""
+    try:
+        row = conn.execute(
+            f"SELECT COUNT(*) as c, COALESCE(SUM(bytes_up),0) as bu, COALESCE(SUM(bytes_down),0) as bd "
+            f"FROM flows WHERE ts >= {since_expr} {dir_clause}"
+        ).fetchone()
+        return {"connections": row["c"], "bytes_up": row["bu"], "bytes_down": row["bd"]}
+    except Exception:
+        return {"connections": 0, "bytes_up": 0, "bytes_down": 0}
+    finally:
+        conn.close()
+
+def flows_top(field="host", range_key="7d", direction=None, limit=30):
+    since_expr = RANGE_MAP.get(range_key, RANGE_MAP["7d"])
+    conn = db_conn()
+    if not conn:
+        return []
+    # 安全白名单
+    allowed = {"host": "COALESCE(host, dst_ip)", "dst_ip": "dst_ip",
+               "src_ip": "src_ip", "country": "country"}
+    expr = allowed.get(field, "COALESCE(host, dst_ip)")
+    dir_clause = f"AND direction='{direction}'" if direction else ""
+    try:
+        rows = conn.execute(
+            f"SELECT {expr} as label, COUNT(*) as cnt, "
+            f"COALESCE(SUM(bytes_up),0)+COALESCE(SUM(bytes_down),0) as total_bytes "
+            f"FROM flows WHERE ts >= {since_expr} AND {expr} IS NOT NULL {dir_clause} "
+            f"GROUP BY label ORDER BY total_bytes DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [{"label": r["label"], "cnt": r["cnt"], "bytes": r["total_bytes"]} for r in rows]
+    except Exception:
+        return []
+    finally:
+        conn.close()
+
+def flows_timeline(range_key="7d", bucket="day", direction=None):
+    since_expr = RANGE_MAP.get(range_key, RANGE_MAP["7d"])
+    conn = db_conn()
+    if not conn:
+        return []
+    fmt = "%Y-%m-%d" if bucket == "day" else "%Y-%m-%d %H:00"
+    dir_clause = f"AND direction='{direction}'" if direction else ""
+    try:
+        rows = conn.execute(
+            f"SELECT strftime('{fmt}', ts, 'unixepoch', 'localtime') as t, "
+            f"COALESCE(SUM(bytes_up),0)+COALESCE(SUM(bytes_down),0) as bytes, COUNT(*) as cnt "
+            f"FROM flows WHERE ts >= {since_expr} {dir_clause} "
+            f"GROUP BY t ORDER BY t"
+        ).fetchall()
+        return [{"t": r["t"], "bytes": r["bytes"], "cnt": r["cnt"]} for r in rows]
+    except Exception:
+        return []
+    finally:
+        conn.close()
+
+def flows_recent(limit=100):
+    conn = db_conn()
+    if not conn:
+        return []
+    try:
+        rows = conn.execute(
+            "SELECT ts, proto, direction, src_ip, src_port, dst_ip, dst_port, "
+            "bytes_up, bytes_down, country, host FROM flows ORDER BY ts DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
+    finally:
+        conn.close()
+
+HTML2 = r"""<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>VPS 流量监控</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0f172a;color:#e2e8f0;font-family:'Segoe UI',system-ui,sans-serif;padding:16px}
+h1{text-align:center;font-size:1.4rem;margin-bottom:16px;color:#f8fafc}
+.tabs{display:flex;gap:4px;margin-bottom:20px;border-bottom:1px solid #1e293b;padding-bottom:0}
+.tab{padding:8px 18px;border-radius:8px 8px 0 0;cursor:pointer;font-size:.85rem;color:#64748b;border:1px solid transparent;border-bottom:none;background:transparent;transition:all .2s}
+.tab.active{background:#1e293b;color:#f1f5f9;border-color:#334155}
+.tab:hover:not(.active){color:#94a3b8}
+.panel{display:none}.panel.active{display:block}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin-bottom:20px}
+.card{background:#1e293b;border-radius:12px;padding:18px}
+.card h2{font-size:.78rem;color:#94a3b8;text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px}
+.big{font-size:1.8rem;font-weight:700;color:#f1f5f9}
+.sub{font-size:.78rem;color:#64748b;margin-top:4px}
+.bar-wrap{background:#0f172a;border-radius:999px;height:8px;margin:10px 0}
+.bar{height:8px;border-radius:999px}
+.bar.green{background:linear-gradient(90deg,#22c55e,#4ade80)}
+.bar.yellow{background:linear-gradient(90deg,#eab308,#facc15)}
+.bar.red{background:linear-gradient(90deg,#ef4444,#f87171)}
+.stat-row{display:flex;justify-content:space-between;font-size:.82rem;margin-top:5px;color:#94a3b8}
+.stat-val{color:#e2e8f0;font-weight:600}
+.chart-card{background:#1e293b;border-radius:12px;padding:18px;margin-bottom:14px}
+.chart-card h2{font-size:.78rem;color:#94a3b8;text-transform:uppercase;letter-spacing:.08em;margin-bottom:14px}
+.badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:.72rem;font-weight:600}
+.badge.ok{background:#166534;color:#86efac}.badge.warn{background:#713f12;color:#fde68a}.badge.crit{background:#7f1d1d;color:#fca5a5}
+.range-bar{display:flex;gap:6px;margin-bottom:16px;flex-wrap:wrap}
+.range-btn{padding:4px 12px;border-radius:6px;font-size:.78rem;cursor:pointer;border:1px solid #334155;background:transparent;color:#64748b}
+.range-btn.active{background:#334155;color:#f1f5f9}
+table{width:100%;border-collapse:collapse;font-size:.82rem}
+th{text-align:left;padding:8px 10px;color:#64748b;border-bottom:1px solid #1e293b;font-weight:500}
+td{padding:7px 10px;border-bottom:1px solid #0f172a;color:#cbd5e1}
+tr:hover td{background:#1e293b}
+.bytes-bar{display:inline-block;height:6px;background:#6366f1;border-radius:3px;vertical-align:middle;margin-left:6px}
+.dir-in{color:#34d399}.dir-out{color:#60a5fa}
+.footer{text-align:center;font-size:.72rem;color:#334155;margin-top:20px}
+select{background:#1e293b;border:1px solid #334155;color:#e2e8f0;padding:4px 10px;border-radius:6px;font-size:.82rem}
+@media(max-width:600px){.big{font-size:1.4rem}.tabs{flex-wrap:wrap}}
+</style>
+</head>
+<body>
+<h1>🖥️ VPS 流量监控</h1>
+<div class="tabs">
+  <div class="tab active" onclick="switchTab('overview',this)">总览</div>
+  <div class="tab" onclick="switchTab('outbound',this)">出站详情</div>
+  <div class="tab" onclick="switchTab('inbound',this)">入站详情</div>
+  <div class="tab" onclick="switchTab('live',this)">实时流水</div>
+</div>
+
+<!-- 总览 -->
+<div class="panel active" id="panel-overview">
+  <div id="overview-content"><div style="text-align:center;color:#475569;padding:40px">加载中...</div></div>
+</div>
+
+<!-- 出站详情 -->
+<div class="panel" id="panel-outbound">
+  <div class="range-bar">
+    <span style="color:#94a3b8;font-size:.8rem;align-self:center">时间范围:</span>
+    <button class="range-btn active" onclick="setRange('out','today',this)">今日</button>
+    <button class="range-btn" onclick="setRange('out','7d',this)">7天</button>
+    <button class="range-btn" onclick="setRange('out','30d',this)">30天</button>
+    <button class="range-btn" onclick="setRange('out','6m',this)">6个月</button>
+  </div>
+  <div id="outbound-content"><div style="text-align:center;color:#475569;padding:40px">加载中...</div></div>
+</div>
+
+<!-- 入站详情 -->
+<div class="panel" id="panel-inbound">
+  <div class="range-bar">
+    <span style="color:#94a3b8;font-size:.8rem;align-self:center">时间范围:</span>
+    <button class="range-btn active" onclick="setRange('in','today',this)">今日</button>
+    <button class="range-btn" onclick="setRange('in','7d',this)">7天</button>
+    <button class="range-btn" onclick="setRange('in','30d',this)">30天</button>
+    <button class="range-btn" onclick="setRange('in','6m',this)">6个月</button>
+  </div>
+  <div id="inbound-content"><div style="text-align:center;color:#475569;padding:40px">加载中...</div></div>
+</div>
+
+<!-- 实时流水 -->
+<div class="panel" id="panel-live">
+  <div id="live-content"><div style="text-align:center;color:#475569;padding:40px">加载中...</div></div>
+</div>
+
+<div class="footer">自动刷新 · <span id="ts"></span></div>
+
+<script>
+const TOKEN_PARAM = "REPLACE_TOKEN_PARAM";
+const BASE = "";
+const fmt = b => {
+  if(!b) return "—";
+  if(b>=1099511627776) return (b/1099511627776).toFixed(2)+" TB";
+  if(b>=1073741824)    return (b/1073741824).toFixed(2)+" GB";
+  if(b>=1048576)       return (b/1048576).toFixed(2)+" MB";
+  if(b>=1024)          return (b/1024).toFixed(2)+" KB";
+  return b+" B";
+};
+const api = async path => {
+  const sep = path.includes("?") ? "&" : "?";
+  const r = await fetch(BASE+path+(TOKEN_PARAM?sep+TOKEN_PARAM:"")).catch(()=>null);
+  return r&&r.ok ? r.json() : null;
+};
+
+let activeTab = "overview";
+let ranges = {out:"today", in:"today"};
+let charts = {};
+
+function switchTab(name, el) {
+  document.querySelectorAll(".tab").forEach(t=>t.classList.remove("active"));
+  document.querySelectorAll(".panel").forEach(p=>p.classList.remove("active"));
+  el.classList.add("active");
+  document.getElementById("panel-"+name).classList.add("active");
+  activeTab = name;
+  loadTab(name);
+}
+
+function setRange(dir, r, el) {
+  el.closest(".range-bar").querySelectorAll(".range-btn").forEach(b=>b.classList.remove("active"));
+  el.classList.add("active");
+  ranges[dir] = r;
+  loadTab(dir==="out"?"outbound":"inbound");
+}
+
+async function loadTab(name) {
+  if(name==="overview") await loadOverview();
+  else if(name==="outbound") await loadDirectional("out");
+  else if(name==="inbound") await loadDirectional("in");
+  else if(name==="live") await loadLive();
+  document.getElementById("ts").textContent = new Date().toLocaleString("zh-CN");
+}
+
+// ---- 总览 ----
+let dayChart=null, monChart=null;
+async function loadOverview() {
+  const d = await api("/api");
+  if(!d){document.getElementById("overview-content").innerHTML="<div style='text-align:center;color:#ef4444;padding:40px'>数据加载失败</div>";return;}
+  const {rx,tx,quota_gb,alert_pct,used_pct,remain,days,months,iface} = d;
+  const total=rx+tx, barCls=used_pct>=90?"red":used_pct>=alert_pct?"yellow":"green";
+  const badgeCls=used_pct>=90?"crit":used_pct>=alert_pct?"warn":"ok";
+  const badgeTxt=used_pct>=90?"⚠ 严重":used_pct>=alert_pct?"⚠ 告警":"✓ 正常";
+  document.getElementById("overview-content").innerHTML=`
+  <div class="grid">
+    <div class="card"><h2>本月合计 <span class="badge ${badgeCls}">${badgeTxt}</span></h2>
+      <div class="big">${fmt(total)}</div><div class="sub">接口: ${iface}</div>
+      <div class="bar-wrap"><div class="bar ${barCls}" style="width:${Math.min(used_pct,100)}%"></div></div>
+      <div class="stat-row"><span>已用 ${used_pct}%</span><span class="stat-val">剩余 ${fmt(remain)}</span></div>
+      <div class="stat-row"><span>配额</span><span class="stat-val">${quota_gb} GB</span></div>
+    </div>
+    <div class="card"><h2>上传 / 下载</h2>
+      <div class="big">${fmt(tx)}</div><div class="sub">↑ 上传</div>
+      <div style="margin-top:12px"><div class="big">${fmt(rx)}</div><div class="sub">↓ 下载</div></div>
+    </div>
+    <div class="card"><h2>今日用量</h2>
+      <div class="big">${days.length?fmt(days[days.length-1].rx+days[days.length-1].tx):"--"}</div>
+      <div class="sub">↑ ${days.length?fmt(days[days.length-1].tx):"--"} &nbsp; ↓ ${days.length?fmt(days[days.length-1].rx):"--"}</div>
+    </div>
+  </div>
+  <div class="chart-card"><h2>近 30 天日流量</h2><canvas id="dayChart" height="70"></canvas></div>
+  <div class="chart-card"><h2>月度流量历史</h2><canvas id="monChart" height="70"></canvas></div>`;
+  if(charts.day){charts.day.destroy();} if(charts.mon){charts.mon.destroy();}
+  const dL=days.map(d=>d.date.slice(5));
+  charts.day=new Chart(document.getElementById("dayChart"),{type:"bar",data:{labels:dL,datasets:[
+    {label:"上传",data:days.map(d=>+(d.tx/1073741824).toFixed(3)),backgroundColor:"rgba(99,102,241,.7)",borderRadius:3},
+    {label:"下载",data:days.map(d=>+(d.rx/1073741824).toFixed(3)),backgroundColor:"rgba(34,197,94,.7)",borderRadius:3}
+  ]},options:{plugins:{legend:{labels:{color:"#94a3b8"}}},scales:{x:{ticks:{color:"#64748b",maxRotation:45}},y:{ticks:{color:"#64748b",callback:v=>v+"GB"}}}}});
+  const mL=months.map(m=>m.month);
+  charts.mon=new Chart(document.getElementById("monChart"),{type:"bar",data:{labels:mL,datasets:[
+    {label:"上传",data:months.map(m=>+(m.tx/1073741824).toFixed(3)),backgroundColor:"rgba(99,102,241,.7)",borderRadius:3},
+    {label:"下载",data:months.map(m=>+(m.rx/1073741824).toFixed(3)),backgroundColor:"rgba(34,197,94,.7)",borderRadius:3}
+  ]},options:{plugins:{legend:{labels:{color:"#94a3b8"}}},scales:{x:{ticks:{color:"#64748b"}},y:{ticks:{color:"#64748b",callback:v=>v+"GB"}}}}});
+}
+
+// ---- 出站 / 入站 ----
+async function loadDirectional(dir) {
+  const range = ranges[dir];
+  const id = dir==="out" ? "outbound-content" : "inbound-content";
+  const [summary, topHost, topCountry, topIp, timeline] = await Promise.all([
+    api(`/api/flows/summary?range=${range}&direction=${dir}`),
+    api(`/api/flows/top?field=host&range=${range}&direction=${dir}&limit=30`),
+    api(`/api/flows/top?field=country&range=${range}&direction=${dir}&limit=15`),
+    api(`/api/flows/top?field=${dir==="out"?"dst_ip":"src_ip"}&range=${range}&direction=${dir}&limit=20`),
+    api(`/api/flows/timeline?range=${range}&direction=${dir}`),
+  ]);
+  const s = summary || {connections:0,bytes_up:0,bytes_down:0};
+  const totalBytes = s.bytes_up + s.bytes_down;
+  const maxBytes = (topHost&&topHost.length) ? topHost[0].bytes : 1;
+  const label = dir==="out" ? "目标域名 / IP" : "来源 IP";
+  const ipField = dir==="out" ? "目标 IP" : "来源 IP";
+
+  let hostRows = (topHost||[]).map(r=>`<tr>
+    <td>${r.label||"—"}</td>
+    <td>${r.cnt}</td>
+    <td>${fmt(r.bytes)}<span class="bytes-bar" style="width:${Math.round(r.bytes/maxBytes*80)}px"></span></td>
+  </tr>`).join("");
+  let ipRows = (topIp||[]).map(r=>`<tr>
+    <td>${r.label||"—"}</td><td>${r.cnt}</td><td>${fmt(r.bytes)}</td>
+  </tr>`).join("");
+  let countryRows = (topCountry||[]).map(r=>`<tr>
+    <td>${r.label||"未知"}</td><td>${r.cnt}</td><td>${fmt(r.bytes)}</td>
+  </tr>`).join("");
+
+  document.getElementById(id).innerHTML=`
+  <div class="grid">
+    <div class="card"><h2>${dir==="out"?"出站总计":"入站总计"}</h2>
+      <div class="big">${fmt(totalBytes)}</div>
+      <div class="stat-row"><span>连接数</span><span class="stat-val">${s.connections.toLocaleString()}</span></div>
+      <div class="stat-row"><span>上行</span><span class="stat-val">${fmt(s.bytes_up)}</span></div>
+      <div class="stat-row"><span>下行</span><span class="stat-val">${fmt(s.bytes_down)}</span></div>
+    </div>
+  </div>
+  <div class="chart-card"><h2>流量趋势</h2><canvas id="chart-${dir}" height="60"></canvas></div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px">
+    <div class="chart-card"><h2>Top 国家</h2>
+      <table><thead><tr><th>国家</th><th>次数</th><th>流量</th></tr></thead>
+      <tbody>${countryRows||"<tr><td colspan=3 style='color:#475569;text-align:center'>暂无数据</td></tr>"}</tbody></table>
+    </div>
+    <div class="chart-card"><h2>Top ${ipField}</h2>
+      <table><thead><tr><th>IP</th><th>次数</th><th>流量</th></tr></thead>
+      <tbody>${ipRows||"<tr><td colspan=3 style='color:#475569;text-align:center'>暂无数据</td></tr>"}</tbody></table>
+    </div>
+  </div>
+  <div class="chart-card"><h2>Top ${label}</h2>
+    <table><thead><tr><th>域名 / IP</th><th>次数</th><th>流量</th></tr></thead>
+    <tbody>${hostRows||"<tr><td colspan=3 style='color:#475569;text-align:center'>暂无数据（需等待采集器收集数据）</td></tr>"}</tbody></table>
+  </div>`;
+
+  // 趋势图
+  const cid = `chart-${dir}`;
+  if(charts[cid]) charts[cid].destroy();
+  const tl = timeline || [];
+  charts[cid]=new Chart(document.getElementById(cid),{type:"bar",data:{
+    labels:tl.map(r=>r.t.slice(5)),
+    datasets:[{label:"流量",data:tl.map(r=>+(r.bytes/1073741824).toFixed(3)),backgroundColor:"rgba(99,102,241,.7)",borderRadius:3}]
+  },options:{plugins:{legend:{display:false}},scales:{x:{ticks:{color:"#64748b",maxRotation:45}},y:{ticks:{color:"#64748b",callback:v=>v+"GB"}}}}});
+}
+
+// ---- 实时流水 ----
+async function loadLive() {
+  const rows = await api("/api/flows/recent?limit=100") || [];
+  const tbody = rows.map(r=>{
+    const ts = new Date(r.ts*1000).toLocaleTimeString("zh-CN");
+    const dirLabel = r.direction==="in"?`<span class="dir-in">↓入站</span>`:`<span class="dir-out">↑出站</span>`;
+    const host = r.host || r.dst_ip || "—";
+    const bytes = fmt((r.bytes_up||0)+(r.bytes_down||0));
+    return `<tr>
+      <td>${ts}</td><td>${dirLabel}</td>
+      <td>${r.src_ip||"—"}</td>
+      <td>${host}${r.dst_port?":"+r.dst_port:""}</td>
+      <td>${r.country||"—"}</td>
+      <td>${bytes}</td>
+    </tr>`;
+  }).join("");
+  document.getElementById("live-content").innerHTML=`
+  <div class="chart-card">
+    <h2>最近 100 条连接 <span style="color:#475569;font-weight:400;font-size:.75rem">(每30秒刷新)</span></h2>
+    <div style="overflow-x:auto">
+    <table><thead><tr><th>时间</th><th>方向</th><th>来源 IP</th><th>目标 域名/IP</th><th>国家</th><th>流量</th></tr></thead>
+    <tbody>${tbody||"<tr><td colspan=6 style='color:#475569;text-align:center;padding:20px'>暂无数据，采集器正在收集中...</td></tr>"}</tbody>
+    </table></div>
+  </div>`;
+}
+
+// 初始加载
+loadTab("overview");
+setInterval(()=>loadTab(activeTab), 30000);
+</script>
+</body></html>"""
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args): pass
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         qs = urllib.parse.parse_qs(parsed.query)
-
-        # token 验证
         if TOKEN and qs.get("token", [""])[0] != TOKEN:
             self.send_response(401)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
             self.wfile.write(b"<html><body style='background:#0f172a;color:#e2e8f0;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;'><h2>401 - Access Denied</h2></body></html>")
             return
-
-        if parsed.path == "/api":
-            self._api()
-        else:
-            self._index()
+        path = parsed.path
+        if path == "/api":           self._api_vnstat()
+        elif path == "/api/flows/summary":  self._api_json(flows_summary(qs.get("range",["7d"])[0], qs.get("direction",[None])[0]))
+        elif path == "/api/flows/top":      self._api_json(flows_top(qs.get("field",["host"])[0], qs.get("range",["7d"])[0], qs.get("direction",[None])[0], int(qs.get("limit",["30"])[0])))
+        elif path == "/api/flows/timeline": self._api_json(flows_timeline(qs.get("range",["7d"])[0], qs.get("bucket",["day"])[0], qs.get("direction",[None])[0]))
+        elif path == "/api/flows/recent":   self._api_json(flows_recent(int(qs.get("limit",["100"])[0])))
+        else:                        self._index()
 
     def _index(self):
-        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-        token_param = ("?token=" + TOKEN) if TOKEN else ""
-        page = HTML.replace("REPLACE_API_URL", f"/api{token_param}")
+        token_param = ("token=" + TOKEN) if TOKEN else ""
+        page = HTML2.replace("REPLACE_TOKEN_PARAM", token_param)
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.end_headers()
         self.wfile.write(page.encode())
 
-    def _api(self):
+    def _api_json(self, data):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode())
+
+    def _api_vnstat(self):
         rx, tx = get_month_data()
         total = rx + tx
         quota_bytes = QUOTA_GB * 1024**3
         used_pct = int(total * 100 / quota_bytes) if quota_bytes else 0
         remain = max(quota_bytes - total, 0)
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        data = {
+        self._api_json({
             "iface": IFACE, "rx": rx, "tx": tx,
             "quota_gb": QUOTA_GB, "alert_pct": ALERT_PCT,
             "used_pct": used_pct, "remain": remain,
             "days": get_day_data(30),
             "months": get_all_months(),
-        }
-        self.wfile.write(json.dumps(data).encode())
+        })
 
 if __name__ == "__main__":
     server = http.server.HTTPServer(("0.0.0.0", PORT), Handler)
@@ -990,7 +1736,7 @@ traffic_web_install() {
         echo -e "${RED}无法检测网络接口${NC}"; return
     fi
 
-    echo -e "\n${YELLOW}=== 安装 Web 流量面板 ===${NC}"
+    echo -e "\n${YELLOW}=== 安装 Web 流量面板 (V3.5) ===${NC}"
     echo -e "接口: ${CYAN}${iface}${NC}  配额: ${QUOTA_GB}GB  重置日: ${RESET_DAY}日"
     echo ""
 
@@ -1004,8 +1750,34 @@ traffic_web_install() {
     read -p "Web 端口 [默认: ${TRAFFIC_WEB_PORT}]: " input_port
     [[ -n "$input_port" ]] && TRAFFIC_WEB_PORT="$input_port"
 
+    # 安装依赖
+    echo -e "${BLUE}>>> 安装 conntrack...${NC}"
+    _traffic_install_conntrack || echo -e "${YELLOW}conntrack 不可用，字节统计将受限。${NC}"
+
+    echo -e "${BLUE}>>> 下载 GeoIP 数据库...${NC}"
+    _traffic_install_geoip || true
+
+    echo -e "${BLUE}>>> 配置 logrotate...${NC}"
+    _traffic_setup_logrotate
+
+    # 若 Xray 已安装，确保 loglevel=info
+    if [[ -f "$XRAY_CONF" ]] && command -v jq &>/dev/null; then
+        local cur_level
+        cur_level=$(jq -r '.log.loglevel // "warning"' "$XRAY_CONF" 2>/dev/null)
+        if [[ "$cur_level" != "info" ]]; then
+            jq '.log.loglevel = "info"' "$XRAY_CONF" > /tmp/xray_conf_tmp.json && \
+                mv /tmp/xray_conf_tmp.json "$XRAY_CONF"
+            systemctl is-active --quiet xray && systemctl reload xray 2>/dev/null || \
+                systemctl is-active --quiet xray && systemctl restart xray 2>/dev/null || true
+            echo -e "${GREEN}Xray loglevel 已更新为 info。${NC}"
+        fi
+    fi
+
+    # 写 web server 和 collector
     _web_write_server "$iface" "$QUOTA_GB" "$RESET_DAY" "$ALERT_PCT" "$token"
     _web_write_service
+    _traffic_install_collector "$iface"
+    _traffic_flows_cleanup_cron
 
     # 保存 token 到配置
     grep -q "^WEB_TOKEN=" "$TRAFFIC_CONF" 2>/dev/null && \
@@ -1019,10 +1791,11 @@ traffic_web_install() {
 
     local ip
     ip=$(get_ip)
-    echo -e "\n${GREEN}✓ Web 面板已启动！${NC}"
+    echo -e "\n${GREEN}✓ Web 面板 + 流量采集器已启动！${NC}"
     echo -e "${BOLD}访问地址:${NC}"
     echo -e "  ${CYAN}http://${ip}:${TRAFFIC_WEB_PORT}/?token=${token}${NC}"
     echo ""
+    echo -e "${YELLOW}注意：采集器需要几分钟才能积累连接数据，实时流水标签页才会显示内容。${NC}"
     echo -e "${YELLOW}提示：建议用 nginx 反代并套 TLS 以避免明文传输密码。${NC}"
 }
 
@@ -1038,33 +1811,49 @@ traffic_web_show_url() {
     fi
     echo -e "\n${YELLOW}=== Web 面板访问信息 ===${NC}"
     echo -e "地址: ${CYAN}http://${ip}:${port}/?token=${token}${NC}"
-    echo -e "状态: $(check_status vps-traffic-web)"
+    echo -e "面板状态:   $(check_status vps-traffic-web)"
+    echo -e "采集器状态: $(check_status vps-traffic-collector)"
 }
 
 traffic_web_remove() {
     systemctl disable vps-traffic-web --now 2>/dev/null
+    systemctl disable vps-traffic-collector --now 2>/dev/null
     rm -f /etc/systemd/system/vps-traffic-web.service
+    rm -f /etc/systemd/system/vps-traffic-collector.service
     rm -rf "$TRAFFIC_WEB_DIR"
     systemctl daemon-reload
-    echo -e "${GREEN}Web 面板已卸载。${NC}"
+    read -p "是否同时删除历史流量数据库？[y/N]: " yn
+    if [[ "$yn" =~ ^[Yy]$ ]]; then
+        rm -rf /var/lib/vps-traffic
+        echo -e "${GREEN}历史数据已删除。${NC}"
+    fi
+    # 移除清理 cron
+    local cron_script="/usr/local/bin/vps-flows-cleanup.sh"
+    crontab -l 2>/dev/null | grep -v "$cron_script" | crontab - 2>/dev/null
+    rm -f "$cron_script"
+    echo -e "${GREEN}Web 面板及采集器已卸载。${NC}"
 }
 
 manage_traffic_web_menu() {
     while true; do
         echo -e "\n${BLUE}--- Web 流量面板 ---${NC}"
-        echo -e "1. 安装/重装 Web 面板"
+        echo -e "1. 安装/重装 Web 面板 (含采集器 + GeoIP)"
         echo -e "2. 查看访问地址"
         echo -e "3. 重启服务"
-        echo -e "4. 查看日志"
-        echo -e "5. 卸载 Web 面板"
+        echo -e "4. 查看面板日志"
+        echo -e "5. 更新 GeoIP 数据库"
+        echo -e "6. 查看采集器状态/日志"
+        echo -e "7. 卸载 Web 面板"
         echo -e "0. 返回"
         read -p "请选择: " OPT
         case $OPT in
             1) traffic_web_install ;;
             2) traffic_web_show_url ;;
-            3) systemctl restart vps-traffic-web && echo "已重启" ;;
+            3) systemctl restart vps-traffic-web vps-traffic-collector && echo "已重启" ;;
             4) journalctl -u vps-traffic-web -n 30 --no-pager ;;
-            5) traffic_web_remove ;;
+            5) _traffic_update_geoip ;;
+            6) echo -e "采集器状态: $(check_status vps-traffic-collector)"; journalctl -u vps-traffic-collector -n 30 --no-pager ;;
+            7) traffic_web_remove ;;
             0) break ;;
             *) echo "无效选择" ;;
         esac
@@ -1077,7 +1866,7 @@ main_menu() {
     while true; do
         clear
         echo -e "${BLUE}=====================================${NC}"
-        echo -e "   全能协议管理脚本 V3.4"
+        echo -e "   全能协议管理脚本 V3.5"
         echo -e "${BLUE}=====================================${NC}"
         echo -e "1. 安装/重置 Reality (TCP 443)  [$(check_status xray)]"
         echo -e "2. 安装/重置 Hysteria2 (UDP 443)[$(check_status hysteria-server)]"
