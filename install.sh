@@ -496,6 +496,8 @@ _traffic_save_conf() {
 QUOTA_GB=${QUOTA_GB}
 RESET_DAY=${RESET_DAY}
 ALERT_PCT=${ALERT_PCT}
+WEB_TOKEN=${WEB_TOKEN:-}
+WEB_PORT=${WEB_PORT:-}
 EOF
 }
 
@@ -835,11 +837,13 @@ VPS 流量采集器 - 双数据源：Xray access.log + conntrack -E
 """
 import re, socket, subprocess, sqlite3, time, threading, json, os, logging
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 
 DB_PATH    = "/var/lib/vps-traffic/flows.db"
 XRAY_LOG   = "/var/log/xray/access.log"
 GEOIP_PATH = "/opt/vps-traffic-web/geoip/GeoLite2-Country.mmdb"
 FILTER_PORTS = {22, 53}          # 过滤 SSH 和 DNS 噪音
+RDNS_WORKERS = 8                  # rDNS 有界线程池大小
 MATCH_WINDOW = 60                # Xray log 与 conntrack 匹配时间窗（秒）
 BATCH_INTERVAL = 5               # 批量写库间隔（秒）
 RDNS_TTL   = 86400               # rDNS 缓存 TTL（秒）
@@ -880,7 +884,7 @@ LOCAL_IPS = get_local_ips()
 # ---- rDNS 缓存 ----
 _rdns_mem = OrderedDict()
 _rdns_lock = threading.Lock()
-_rdns_sem = threading.Semaphore(RDNS_RATE)
+_rdns_pool = ThreadPoolExecutor(max_workers=RDNS_WORKERS, thread_name_prefix="rdns")
 
 def rdns_lookup(ip):
     now = int(time.time())
@@ -899,12 +903,11 @@ def rdns_lookup(ip):
                 return row[0]
     except Exception:
         pass
-    # 实际查询
-    with _rdns_sem:
-        try:
-            host = socket.gethostbyaddr(ip)[0]
-        except Exception:
-            host = None
+    # 实际查询（在调用方的线程池中执行，此处直接同步调用）
+    try:
+        host = socket.gethostbyaddr(ip)[0]
+    except Exception:
+        host = None
     # 写缓存
     try:
         with sqlite3.connect(DB_PATH, timeout=10) as conn:
@@ -1076,14 +1079,14 @@ def conntrack_reader():
                              bytes_up, bytes_down, country, host))
                 else:
                     country = geoip(peer_ip)
-                    # 非 Xray 流量，尝试 rDNS（后台线程）
+                    # 非 Xray 流量，提交到有界线程池做 rDNS（最多 RDNS_WORKERS 个并发）
                     def do_rdns(ts=ts, proto=proto, direction=direction,
                                 src_ip=src_ip, src_port=src_port, dst_ip=dst_ip, dst_port=dst_port,
                                 bytes_up=bytes_up, bytes_down=bytes_down, country=country, peer_ip=peer_ip):
                         host = rdns_lookup(peer_ip)
                         enqueue((ts, proto, direction, src_ip, src_port, dst_ip, dst_port,
                                  bytes_up, bytes_down, country, host))
-                    threading.Thread(target=do_rdns, daemon=True).start()
+                    _rdns_pool.submit(do_rdns)
         except Exception as e:
             log.warning("conntrack_reader error: %s", e)
             time.sleep(5)

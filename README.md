@@ -18,7 +18,7 @@
 在终端执行以下命令即可启动交互菜单：
 
 ```bash
-bash <(curl -Ls vfly.click)
+bash <(curl -Ls https://vfly.click)
 ```
 
 ## ✨ 功能特性 / Features
