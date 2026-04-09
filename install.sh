@@ -220,10 +220,13 @@ install_reality() {
   }
 }
 EOF
-    chmod 600 "$XRAY_CONF"
+    # nobody 是 xray 服务的运行用户，需要读权限；640 + group=nobody 保证其他用户无法读取
+    chown root:nobody "$XRAY_CONF" 2>/dev/null || true
+    chmod 640 "$XRAY_CONF"
     # 保存公钥到文件以便后续查看
     echo "$PUB" > /usr/local/etc/xray/public.key
-    chmod 600 /usr/local/etc/xray/public.key
+    chown root:nobody /usr/local/etc/xray/public.key 2>/dev/null || true
+    chmod 640 /usr/local/etc/xray/public.key
 
     if ! systemctl restart xray; then
         echo -e "${RED}Xray 服务启动失败，请查看日志: journalctl -u xray -n 20${NC}"
