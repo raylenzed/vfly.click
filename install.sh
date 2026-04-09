@@ -1282,9 +1282,89 @@ def hy2_log_reader():
             log.warning("hy2_log_reader error: %s", e)
             time.sleep(5)
 
+# ---- iptables 字节计数（ss 模式下替代 conntrack 统计字节）----
+_ipt_prev  = {}   # {(chain, port): bytes}
+_ipt_delta = {}   # {(proto_name, 'in'/'out'): bytes_since_last_poll}
+_ipt_lock  = threading.Lock()
+
+def _setup_ipt_rules():
+    """为每个代理端口在 INPUT/OUTPUT 链插入计数规则"""
+    for port, proto in PROTO_PORTS.items():
+        transport = "udp" if proto == "hysteria2" else "tcp"
+        for chain, flag in [("INPUT", f"--dport {port}"),
+                             ("OUTPUT", f"--sport {port}")]:
+            # 幂等：先删再加
+            subprocess.run(["iptables", "-D", chain, "-p", transport,
+                            flag.split()[0], flag.split()[1]], capture_output=True)
+            try:
+                subprocess.run(["iptables", "-I", chain, "1",
+                                "-p", transport,
+                                flag.split()[0], flag.split()[1]], check=True,
+                               capture_output=True)
+            except Exception as e:
+                log.warning("iptables 规则添加失败: %s", e)
+    log.info("iptables 字节计数规则已设置")
+
+def _read_ipt_bytes():
+    """读取 iptables 计数，返回 {(chain, port): total_bytes}"""
+    result = {}
+    try:
+        for chain in ("INPUT", "OUTPUT"):
+            out = subprocess.check_output(
+                ["iptables", "-nvxL", chain], text=True, timeout=5)
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) < 9:
+                    continue
+                try:
+                    b = int(parts[1])
+                except ValueError:
+                    continue
+                for part in parts:
+                    if part.startswith("dpt:") or part.startswith("spt:"):
+                        try:
+                            port = int(part.split(":")[1])
+                            result[(chain, port)] = b
+                        except ValueError:
+                            pass
+    except Exception as e:
+        log.warning("iptables 读取失败: %s", e)
+    return result
+
+def _ipt_poller():
+    """定期轮询 iptables 计数增量，存入 _ipt_delta 供 ss_poller 使用"""
+    global _ipt_prev
+    _setup_ipt_rules()
+    _ipt_prev = _read_ipt_bytes()
+    while True:
+        time.sleep(POLL_INTERVAL)
+        curr = _read_ipt_bytes()
+        with _ipt_lock:
+            for port, proto in PROTO_PORTS.items():
+                for chain, direction in [("INPUT", "in"), ("OUTPUT", "out")]:
+                    key = (chain, port)
+                    delta = curr.get(key, 0) - _ipt_prev.get(key, 0)
+                    if delta > 0:
+                        dk = (proto, direction)
+                        _ipt_delta[dk] = _ipt_delta.get(dk, 0) + delta
+        _ipt_prev = curr
+
+def _consume_ipt_bytes(proto, direction, n_conns):
+    """从 _ipt_delta 取出字节数，按连接数平均分配"""
+    if n_conns <= 0:
+        return 0
+    with _ipt_lock:
+        dk = (proto, direction)
+        total = _ipt_delta.pop(dk, 0)
+    return total // n_conns if total else 0
+
 def ss_poller():
-    """ss-based 连接追踪（conntrack 不可用时的降级方案，不统计字节数）"""
-    log.info("ss 轮询模式启动 (conntrack 不可用，间隔 %ds)", POLL_INTERVAL)
+    """ss-based 连接追踪（conntrack 不可用时的降级方案）
+    字节数来自 iptables 计数器增量（按活跃连接数平分）"""
+    log.info("ss 轮询模式启动 (conntrack 不可用，间隔 %ds，iptables 计数)", POLL_INTERVAL)
+    # 启动 iptables 计数线程
+    threading.Thread(target=_ipt_poller, daemon=True).start()
+
     active = {}  # key(local_ip, local_port, peer_ip, peer_port) -> first_ts
     while True:
         try:
@@ -1293,6 +1373,8 @@ def ss_poller():
                 text=True, timeout=5
             )
             current = set()
+            # 统计每个协议当前活跃的入站连接数（用于字节分配）
+            proto_in_count = {}
             for line in out.splitlines():
                 parts = line.split()
                 if len(parts) < 4:
@@ -1315,20 +1397,36 @@ def ss_poller():
                 current.add(key)
                 if key not in active:
                     active[key] = int(time.time())
+                # 统计活跃入站连接数
+                if local_port in PROTO_PORTS:
+                    proto_name = PROTO_PORTS[local_port]
+                    proto_in_count[proto_name] = proto_in_count.get(proto_name, 0) + 1
 
-            # 消失的连接 → 记录（字节数为 0，依赖 xray/hy2 pending 补充域名）
+            # 消失的连接：从 iptables 增量中分配字节
+            gone_by_proto = {}  # {(proto_name, direction): [keys]}
             for key in list(active):
                 if key not in current:
                     fts = active.pop(key)
                     local_ip, local_port, peer_ip, peer_port = key
                     if local_port in PROTO_PORTS:
-                        # 入站：peer 是客户端
-                        _handle_gone_conn("tcp", peer_ip, local_ip,
-                                          peer_port, local_port, 0, 0, fts)
+                        proto_name = PROTO_PORTS[local_port]
+                        gone_by_proto.setdefault((proto_name, "in"), []).append(
+                            ("tcp", peer_ip, local_ip, peer_port, local_port, fts))
                     else:
-                        # 出站：local_port 是本机随机端口
-                        _handle_gone_conn("tcp", local_ip, peer_ip,
-                                          local_port, peer_port, 0, 0, fts)
+                        gone_by_proto.setdefault((None, "out"), []).append(
+                            ("tcp", local_ip, peer_ip, local_port, peer_port, fts))
+
+            for (proto_name, direction), conns in gone_by_proto.items():
+                bytes_per_conn = _consume_ipt_bytes(proto_name, direction, len(conns))
+                for conn in conns:
+                    proto, src_ip, dst_ip, sport, dport, fts = conn
+                    if direction == "in":
+                        _handle_gone_conn(proto, src_ip, dst_ip, sport, dport,
+                                          bytes_per_conn, bytes_per_conn // 4, fts)
+                    else:
+                        _handle_gone_conn(proto, src_ip, dst_ip, sport, dport,
+                                          bytes_per_conn, bytes_per_conn // 4, fts)
+
         except Exception as e:
             log.warning("ss_poller error: %s", e)
         time.sleep(POLL_INTERVAL)
