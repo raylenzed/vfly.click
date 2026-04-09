@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # =========================================================
-# VFly - Multi-Protocol Manager V3.5
+# VFly - Multi-Protocol Manager V3.7
 # =========================================================
 
 # --- 颜色定义 ---
@@ -1850,7 +1850,7 @@ traffic_web_install() {
         echo -e "${RED}无法检测网络接口${NC}"; return
     fi
 
-    echo -e "\n${YELLOW}=== 安装 Web 流量面板 (V3.5) ===${NC}"
+    echo -e "\n${YELLOW}=== 安装 Web 流量面板 (V3.7) ===${NC}"
     echo -e "接口: ${CYAN}${iface}${NC}  配额: ${QUOTA_GB}GB  重置日: ${RESET_DAY}日"
     echo ""
 
@@ -1993,7 +1993,7 @@ manage_traffic_web_menu() {
 main_menu() {
     while true; do
         echo -e "\n${BLUE}=====================================${NC}"
-        echo -e "   全能协议管理脚本 V3.5"
+        echo -e "   全能协议管理脚本 V3.7"
         echo -e "${BLUE}=====================================${NC}"
         echo -e "1. 安装/重置 Reality (TCP 443)  [$(check_status xray)]"
         echo -e "2. 安装/重置 Hysteria2 (UDP 443)[$(check_status hysteria-server)]"
