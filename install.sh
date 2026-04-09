@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # =========================================================
-# VFly - Multi-Protocol Manager V3.10
+# VFly - Multi-Protocol Manager V3.11
 # =========================================================
 
 # --- 颜色定义 ---
@@ -913,14 +913,17 @@ def detect_proto_ports():
                     break
     except Exception:
         pass
-    # Snell
+    # Snell (config format: listen = 0.0.0.0:PORT)
     try:
         with open("/etc/snell/snell-server.conf") as f:
             for line in f:
-                if "=" in line and "port" in line.lower():
+                line = line.strip()
+                if line.startswith("listen") and "=" in line:
                     val = line.split("=", 1)[1].strip()
-                    if val.isdigit():
-                        ports[int(val)] = "snell"
+                    if ":" in val:
+                        port_s = val.rsplit(":", 1)[1]
+                        if port_s.isdigit():
+                            ports[int(port_s)] = "snell"
     except Exception:
         pass
     return ports
@@ -1219,17 +1222,84 @@ def hy2_log_reader():
             log.warning("hy2_log_reader error: %s", e)
             time.sleep(5)
 
+def ss_poller():
+    """ss-based 连接追踪（conntrack 不可用时的降级方案，不统计字节数）"""
+    log.info("ss 轮询模式启动 (conntrack 不可用，间隔 %ds)", POLL_INTERVAL)
+    active = {}  # key(local_ip, local_port, peer_ip, peer_port) -> first_ts
+    while True:
+        try:
+            out = subprocess.check_output(
+                ["ss", "-tnH", "state", "established"],
+                text=True, timeout=5
+            )
+            current = set()
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) < 5:
+                    continue
+                # Format: ESTAB RecvQ SendQ LocalAddr:Port PeerAddr:Port [...]
+                local = parts[3]
+                peer  = parts[4]
+                try:
+                    lcolon = local.rfind(":")
+                    pcolon = peer.rfind(":")
+                    local_ip   = local[:lcolon]
+                    local_port = int(local[lcolon+1:])
+                    peer_ip    = peer[:pcolon]
+                    peer_port  = int(peer[pcolon+1:])
+                except (ValueError, IndexError):
+                    continue
+                if local_port in FILTER_PORTS or peer_port in FILTER_PORTS:
+                    continue
+                key = (local_ip, local_port, peer_ip, peer_port)
+                current.add(key)
+                if key not in active:
+                    active[key] = int(time.time())
+
+            # 消失的连接 → 记录（字节数为 0，依赖 xray/hy2 pending 补充域名）
+            for key in list(active):
+                if key not in current:
+                    fts = active.pop(key)
+                    local_ip, local_port, peer_ip, peer_port = key
+                    if local_port in PROTO_PORTS:
+                        # 入站：peer 是客户端
+                        _handle_gone_conn("tcp", peer_ip, local_ip,
+                                          peer_port, local_port, 0, 0, fts)
+                    else:
+                        # 出站：local_port 是本机随机端口
+                        _handle_gone_conn("tcp", local_ip, peer_ip,
+                                          local_port, peer_port, 0, 0, fts)
+        except Exception as e:
+            log.warning("ss_poller error: %s", e)
+        time.sleep(POLL_INTERVAL)
+
 def conntrack_poller():
-    """主采集循环：轮询 /proc/net/nf_conntrack，连接消失即记录"""
+    """主采集循环：轮询 /proc/net/nf_conntrack，连接消失即记录。
+    若 conntrack 表持续为空（内核不走 netfilter），自动切换到 ss_poller()。"""
     active = {}   # key(proto,src,dst,sport,dport) -> (bytes_orig, bytes_reply, first_ts)
     if not os.path.exists(CT_FILE):
-        log.warning("conntrack 表 %s 不存在，字节统计不可用", CT_FILE)
+        log.warning("conntrack 表 %s 不存在，切换到 ss 模式", CT_FILE)
+        ss_poller()
         return
     log.info("conntrack 轮询模式启动 (间隔 %ds)", POLL_INTERVAL)
+    empty_streak = 0
     while True:
         try:
             with open(CT_FILE) as f:
                 lines = f.readlines()
+
+            # 检测 conntrack 是否实际工作
+            if not lines:
+                empty_streak += 1
+                if empty_streak >= 5:
+                    log.warning("conntrack 表持续为空 (%d次)，切换到 ss 模式", empty_streak)
+                    ss_poller()
+                    return
+                time.sleep(POLL_INTERVAL)
+                continue
+            else:
+                empty_streak = 0
+
             current = set()
             for line in lines:
                 parsed = _parse_ct_line(line)
@@ -1961,7 +2031,7 @@ traffic_web_install() {
         echo -e "${RED}无法检测网络接口${NC}"; return
     fi
 
-    echo -e "\n${YELLOW}=== 安装 Web 流量面板 (V3.10) ===${NC}"
+    echo -e "\n${YELLOW}=== 安装 Web 流量面板 (V3.11) ===${NC}"
     echo -e "接口: ${CYAN}${iface}${NC}  配额: ${QUOTA_GB}GB  重置日: ${RESET_DAY}日"
     echo ""
 
@@ -2140,7 +2210,7 @@ manage_traffic_web_menu() {
 main_menu() {
     while true; do
         echo -e "\n${BLUE}=====================================${NC}"
-        echo -e "   全能协议管理脚本 V3.10"
+        echo -e "   全能协议管理脚本 V3.11"
         echo -e "${BLUE}=====================================${NC}"
         echo -e "1. 安装/重置 Reality (TCP 443)  [$(check_status xray)]"
         echo -e "2. 安装/重置 Hysteria2 (UDP 443)[$(check_status hysteria-server)]"
