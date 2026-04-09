@@ -574,8 +574,26 @@ _traffic_install_conntrack() {
     fi
     # 启用 conntrack 计数（默认关闭）
     sysctl -w net.netfilter.nf_conntrack_acct=1 &>/dev/null || true
-    if ! grep -q "^net.netfilter.nf_conntrack_acct" /etc/sysctl.d/99-conntrack.conf 2>/dev/null; then
-        echo "net.netfilter.nf_conntrack_acct=1" > /etc/sysctl.d/99-conntrack.conf
+    sysctl -w net.netfilter.nf_conntrack_max=131072 &>/dev/null || true
+    cat > /etc/sysctl.d/99-conntrack.conf <<EOF
+net.netfilter.nf_conntrack_acct=1
+net.netfilter.nf_conntrack_max=131072
+EOF
+    # 部分内核（如 DMIT）默认不追踪连接，需要在 iptables 中引用 conntrack 才会激活
+    # 添加触发规则（幂等）
+    iptables -D INPUT  -m conntrack --ctstate NEW -j ACCEPT 2>/dev/null
+    iptables -D OUTPUT -m conntrack --ctstate NEW -j ACCEPT 2>/dev/null
+    iptables -I INPUT  1 -m conntrack --ctstate NEW -j ACCEPT
+    iptables -I OUTPUT 1 -m conntrack --ctstate NEW -j ACCEPT
+    # 持久化 iptables 规则（开机恢复）
+    mkdir -p /etc/iptables
+    iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+    if [ ! -f /etc/network/if-pre-up.d/iptables-restore ]; then
+        cat > /etc/network/if-pre-up.d/iptables-restore <<'SCRIPT'
+#!/bin/sh
+[ -f /etc/iptables/rules.v4 ] && iptables-restore < /etc/iptables/rules.v4
+SCRIPT
+        chmod +x /etc/network/if-pre-up.d/iptables-restore
     fi
     echo -e "${GREEN}conntrack 就绪。${NC}"
 }
