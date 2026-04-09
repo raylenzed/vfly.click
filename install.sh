@@ -883,7 +883,7 @@ XRAY_LOG   = "/var/log/xray/access.log"
 GEOIP_PATH = "/opt/vps-traffic-web/geoip/GeoLite2-Country.mmdb"
 FILTER_PORTS = {22, 53}          # 过滤 SSH 和 DNS 噪音
 RDNS_WORKERS = 8                  # rDNS 有界线程池大小
-MATCH_WINDOW = 60                # Xray log 与 conntrack 匹配时间窗（秒）
+MATCH_WINDOW = 15                # Xray log 与 conntrack 匹配时间窗（秒，无 conntrack 时快速落库）
 BATCH_INTERVAL = 5               # 批量写库间隔（秒）
 RDNS_TTL   = 86400               # rDNS 缓存 TTL（秒）
 RDNS_RATE  = 10                  # rDNS 每秒最多查询次数
@@ -1060,9 +1060,10 @@ def flush_writer():
             log.error("DB write error: %s", e)
 
 # ---- Xray 日志解析 ----
-# 格式: 2024/01/01 12:34:56 from 1.2.3.4:54321 accepted tcp:www.youtube.com:443 [tag -> direct]
+# 格式: 2026/04/09 13:37:24.984632 from 1.2.3.4:54321 accepted tcp:host:443 [tag]
+# 时间戳含微秒 .xxxxxx，用 (?:\.\d+)? 兼容
 _xray_re = re.compile(
-    r"(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}) from ([\d.a-fA-F:]+):(\d+) accepted \w+:([\w\.\-\[\]:]+):(\d+)"
+    r"(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})(?:\.\d+)? from ([\d.a-fA-F:]+):(\d+) accepted \w+:([\w\.\-\[\]:]+):(\d+)"
 )
 # 挂起的 Xray 事件，等待 conntrack 提供字节数
 # key: (src_ip, src_port, dst_port)  value: [ts, direction, src_ip, src_port, dst_ip, dst_port, country, host, expire_time]
