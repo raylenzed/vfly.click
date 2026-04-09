@@ -405,16 +405,17 @@ install_snell() {
     mkdir -p /etc/snell
     PSK=$(openssl rand -base64 20 | tr -dc 'a-zA-Z0-9')
     
+    GROUP="nobody"
+    grep -q "nogroup" /etc/group && GROUP="nogroup"
+
     cat > $SNELL_CONF <<EOF
 [snell-server]
 listen = 0.0.0.0:11807
 psk = $PSK
 ipv6 = false
 EOF
-    chmod 600 "$SNELL_CONF"
-
-    GROUP="nobody"
-    grep -q "nogroup" /etc/group && GROUP="nogroup"
+    chown root:"$GROUP" "$SNELL_CONF"
+    chmod 640 "$SNELL_CONF"
 
     cat > /lib/systemd/system/snell.service <<EOF
 [Unit]
