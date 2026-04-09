@@ -1793,7 +1793,7 @@ function toggleTheme(){
 })();
 function toggleSidebar(){document.getElementById("sidebar").classList.toggle("open");}
 const fmt=b=>{
-  if(!b)return "—";
+  if(b==null||b===undefined)return "—";
   if(b>=1099511627776)return (b/1099511627776).toFixed(2)+" TB";
   if(b>=1073741824)return (b/1073741824).toFixed(2)+" GB";
   if(b>=1048576)return (b/1048576).toFixed(2)+" MB";
