@@ -220,12 +220,14 @@ install_reality() {
   }
 }
 EOF
-    # nobody 是 xray 服务的运行用户，需要读权限；640 + group=nobody 保证其他用户无法读取
-    chown root:nobody "$XRAY_CONF" 2>/dev/null || true
+    # 收紧配置文件权限：640 + xray 运行组，防止低权限用户读取密钥
+    local XRAY_GROUP="nobody"
+    grep -q "^nogroup:" /etc/group && XRAY_GROUP="nogroup"
+    chown root:"$XRAY_GROUP" "$XRAY_CONF"
     chmod 640 "$XRAY_CONF"
     # 保存公钥到文件以便后续查看
     echo "$PUB" > /usr/local/etc/xray/public.key
-    chown root:nobody /usr/local/etc/xray/public.key 2>/dev/null || true
+    chown root:"$XRAY_GROUP" /usr/local/etc/xray/public.key
     chmod 640 /usr/local/etc/xray/public.key
 
     if ! systemctl restart xray; then
