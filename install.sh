@@ -585,17 +585,27 @@ EOF
     iptables -D OUTPUT -m conntrack --ctstate NEW -j ACCEPT 2>/dev/null
     iptables -I INPUT  1 -m conntrack --ctstate NEW -j ACCEPT
     iptables -I OUTPUT 1 -m conntrack --ctstate NEW -j ACCEPT
-    # 持久化 iptables 规则（开机恢复）
+    # 持久化 iptables 规则（systemd service，兼容 systemd-networkd 和 ifupdown）
     mkdir -p /etc/iptables
     iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-    if [ ! -f /etc/network/if-pre-up.d/iptables-restore ]; then
-        cat > /etc/network/if-pre-up.d/iptables-restore <<'SCRIPT'
-#!/bin/sh
-[ -f /etc/iptables/rules.v4 ] && iptables-restore < /etc/iptables/rules.v4
-SCRIPT
-        chmod +x /etc/network/if-pre-up.d/iptables-restore
-    fi
-    echo -e "${GREEN}conntrack 就绪。${NC}"
+    cat > /etc/systemd/system/iptables-restore.service <<'SVC'
+[Unit]
+Description=Restore iptables rules (conntrack activation)
+Before=network-pre.target
+Wants=network-pre.target
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'iptables-restore < /etc/iptables/rules.v4'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+SVC
+    systemctl daemon-reload
+    systemctl enable iptables-restore.service &>/dev/null
+    echo -e "${GREEN}conntrack 就绪（已设置开机自动恢复）。${NC}"
 }
 
 _traffic_install_geoip() {
