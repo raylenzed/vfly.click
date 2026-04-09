@@ -591,9 +591,23 @@ _traffic_install_geoip() {
     fi
     # 安装 maxminddb python 库
     if ! python3 -c "import maxminddb" &>/dev/null; then
-        pip3 install maxminddb --quiet 2>/dev/null || \
-        pip install maxminddb --quiet 2>/dev/null || \
-        echo -e "${YELLOW}maxminddb 安装失败，国家显示将不可用。${NC}"
+        # 优先用系统包管理（无需 --break-system-packages）
+        if command -v apt-get &>/dev/null; then
+            apt-get install -y python3-maxminddb &>/dev/null || true
+        elif command -v yum &>/dev/null; then
+            yum install -y python3-maxminddb &>/dev/null || true
+        fi
+        # 若系统包不存在，回退 pip（兼容 PEP 668 externally-managed 环境）
+        if ! python3 -c "import maxminddb" &>/dev/null; then
+            pip3 install maxminddb --quiet --break-system-packages 2>/dev/null || \
+            pip3 install maxminddb --quiet 2>/dev/null || \
+            pip install maxminddb --quiet 2>/dev/null || true
+        fi
+        if python3 -c "import maxminddb" &>/dev/null; then
+            echo -e "${GREEN}maxminddb 安装成功。${NC}"
+        else
+            echo -e "${YELLOW}maxminddb 安装失败，国家显示将不可用。${NC}"
+        fi
     fi
     echo -e "${GREEN}GeoIP 数据库就绪: $geoip_dir/GeoLite2-Country.mmdb${NC}"
 }
