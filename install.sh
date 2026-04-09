@@ -1223,11 +1223,12 @@ def _handle_gone_conn(proto, src_ip, dst_ip, sport, dport, bytes_orig, bytes_rep
         _rdns_pool.submit(do_rdns)
 
 # ---- Hysteria2 日志解析（获取目标域名 + 标注协议）----
-# Hysteria2 server 日志格式（journald）：
-#   client 1.2.3.4:12345: TCP request: www.youtube.com:443
-#   client 1.2.3.4:12345: UDP request: 8.8.8.8:53 (may also be "tunnel")
+# Hysteria2 v2 使用结构化 JSON 日志，格式：
+#   TIMESTAMP  INFO  TCP request  {"addr":"1.2.3.4:PORT","reqAddr":"domain:PORT",...}
+#   TIMESTAMP  WARN  TCP error    {"addr":"1.2.3.4:PORT","reqAddr":"domain:PORT",...}
+# 用 reqAddr 字段匹配目标域名（包含 request 和 error 两种情况都有目标地址）
 _hy2_re = re.compile(
-    r"client\s+([\d.a-fA-F:]+):(\d+).*?(?:TCP|UDP)\s+(?:request|tunnel)[:\s]+([^\s:]+):(\d+)"
+    r'"addr":\s*"([\d.a-fA-F\[\]:]+):(\d+)".*?"reqAddr":\s*"([^"]+):(\d+)"'
 )
 
 def hy2_log_reader():
