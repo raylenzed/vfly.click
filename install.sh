@@ -1891,8 +1891,7 @@ manage_traffic_web_menu() {
 
 main_menu() {
     while true; do
-        clear
-        echo -e "${BLUE}=====================================${NC}"
+        echo -e "\n${BLUE}=====================================${NC}"
         echo -e "   全能协议管理脚本 V3.5"
         echo -e "${BLUE}=====================================${NC}"
         echo -e "1. 安装/重置 Reality (TCP 443)  [$(check_status xray)]"
@@ -1911,13 +1910,13 @@ main_menu() {
         read -p "请输入选项: " CHOICE
 
         case $CHOICE in
-            1) install_reality; read -p "按回车继续..." ;;
-            2) install_hy2; read -p "按回车继续..." ;;
-            3) install_snell; read -p "按回车继续..." ;;
-            4) manage_reality_menu; read -p "按回车继续..." ;;
-            5) manage_hy2_menu; read -p "按回车继续..." ;;
-            6) manage_snell_menu; read -p "按回车继续..." ;;
-            7) enable_bbr; read -p "按回车继续..." ;;
+            1) install_reality ;;
+            2) install_hy2 ;;
+            3) install_snell ;;
+            4) manage_reality_menu ;;
+            5) manage_hy2_menu ;;
+            6) manage_snell_menu ;;
+            7) enable_bbr ;;
             8) manage_traffic_menu ;;
             9) manage_traffic_web_menu ;;
             0) exit 0 ;;
