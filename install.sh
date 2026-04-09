@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # =========================================================
-# VFly - Multi-Protocol Manager V3.8
+# VFly - Multi-Protocol Manager V3.9
 # =========================================================
 
 # --- 颜色定义 ---
@@ -1118,76 +1118,110 @@ def xray_pending_reaper():
             ts, direction, src_ip, src_port, dst_ip, dst_port, country, host, _, protocol = val
             enqueue((ts, "tcp", direction, src_ip, src_port, dst_ip, dst_port, None, None, country, host, protocol))
 
-# ---- conntrack 解析 ----
-# 格式(DESTROY): [时间戳] tcp src=1.2.3.4 dst=5.6.7.8 sport=54321 dport=443 ... bytes=1234 ...
-_ct_re = re.compile(
-    r"\[(\d+\.\d+)\].*?(\w+)\s+\d+\s+\d+.*?src=([\d.a-fA-F:]+)\s+dst=([\d.a-fA-F:]+)\s+sport=(\d+)\s+dport=(\d+)"
-    r".*?bytes=(\d+).*?bytes=(\d+)"
-)
+# ---- conntrack 轮询（替代 conntrack -E，兼容不支持事件推送的环境）----
+# 每 POLL_INTERVAL 秒读取 /proc/net/nf_conntrack，对消失的连接触发记录
+# nf_conntrack_acct=1 时每行有两组 bytes= 字段（orig/reply 方向）
+CT_FILE = "/proc/net/nf_conntrack"
+POLL_INTERVAL = 5   # 秒，越小越实时但 CPU 略高
+_ct_src_re  = re.compile(r"src=([\d.]+)\s+dst=([\d.]+)\s+sport=(\d+)\s+dport=(\d+)")
+_ct_bytes_re = re.compile(r"bytes=(\d+)")
+_ct_proto_re = re.compile(r"^\S+\s+\d+\s+(\w+)")
 
-def conntrack_reader():
-    """conntrack -E -o timestamp -e DESTROY 逐行解析，与 Xray pending 合并"""
+def _parse_ct_line(line):
+    """返回 (proto, src_ip, dst_ip, sport, dport, bytes_orig, bytes_reply) 或 None"""
+    pm = _ct_proto_re.match(line)
+    if not pm:
+        return None
+    proto = pm.group(1)
+    pairs = _ct_src_re.findall(line)
+    if not pairs:
+        return None
+    src_ip, dst_ip, sport_s, dport_s = pairs[0]   # 原始方向
+    sport, dport = int(sport_s), int(dport_s)
+    bvals = _ct_bytes_re.findall(line)
+    bytes_orig  = int(bvals[0]) if len(bvals) > 0 else 0
+    bytes_reply = int(bvals[1]) if len(bvals) > 1 else 0
+    return proto, src_ip, dst_ip, sport, dport, bytes_orig, bytes_reply
+
+def _handle_gone_conn(proto, src_ip, dst_ip, sport, dport, bytes_orig, bytes_reply, first_ts):
+    """连接消失时处理：匹配 Xray pending 或走 rDNS"""
+    if dst_ip in LOCAL_IPS:
+        direction, peer_ip = "in",  src_ip
+        bytes_up, bytes_down = bytes_orig, bytes_reply
+    else:
+        direction, peer_ip = "out", dst_ip
+        bytes_up, bytes_down = bytes_orig, bytes_reply
+
+    xray_key = (src_ip, sport, dport)
+    matched = None
+    with _xray_lock:
+        if xray_key in _xray_pending:
+            matched = _xray_pending.pop(xray_key)
+
+    if matched:
+        _, _, _, _, xdst_ip, _, country, host, _, protocol = matched
+        enqueue((first_ts, proto, direction, src_ip, sport,
+                 xdst_ip or dst_ip, dport, bytes_up, bytes_down, country, host, protocol))
+    else:
+        country  = geoip(peer_ip)
+        protocol = PROTO_PORTS.get(dport if direction == "in" else sport)
+        def do_rdns(ts=first_ts, proto=proto, direction=direction,
+                    src_ip=src_ip, sport=sport, dst_ip=dst_ip, dport=dport,
+                    bytes_up=bytes_up, bytes_down=bytes_down,
+                    country=country, peer_ip=peer_ip, protocol=protocol):
+            host = rdns_lookup(peer_ip)
+            enqueue((ts, proto, direction, src_ip, sport, dst_ip, dport,
+                     bytes_up, bytes_down, country, host, protocol))
+        _rdns_pool.submit(do_rdns)
+
+def conntrack_poller():
+    """主采集循环：轮询 /proc/net/nf_conntrack，连接消失即记录"""
+    active = {}   # key(proto,src,dst,sport,dport) -> (bytes_orig, bytes_reply, first_ts)
+    if not os.path.exists(CT_FILE):
+        log.warning("conntrack 表 %s 不存在，字节统计不可用", CT_FILE)
+        return
+    log.info("conntrack 轮询模式启动 (间隔 %ds)", POLL_INTERVAL)
     while True:
         try:
-            proc = subprocess.Popen(
-                ["conntrack", "-E", "-o", "timestamp", "-e", "DESTROY"],
-                stdout=subprocess.PIPE, text=True)
-            for line in proc.stdout:
-                m = _ct_re.search(line)
-                if not m:
+            with open(CT_FILE) as f:
+                lines = f.readlines()
+            current = set()
+            for line in lines:
+                parsed = _parse_ct_line(line)
+                if not parsed:
                     continue
-                ts_f, proto, src_ip, dst_ip, sport_s, dport_s, bytes1_s, bytes2_s = m.groups()
-                ts = int(float(ts_f))
-                src_port = int(sport_s)
-                dst_port = int(dport_s)
-                bytes1 = int(bytes1_s)
-                bytes2 = int(bytes2_s)
-                if dst_port in FILTER_PORTS or src_port in FILTER_PORTS:
+                proto, src_ip, dst_ip, sport, dport, bo, br = parsed
+                if sport in FILTER_PORTS or dport in FILTER_PORTS:
                     continue
-                # 判断方向
-                if dst_ip in LOCAL_IPS:
-                    direction = "in"
-                    peer_ip = src_ip
-                    bytes_up, bytes_down = bytes1, bytes2
+                key = (proto, src_ip, dst_ip, sport, dport)
+                current.add(key)
+                if key not in active:
+                    active[key] = (bo, br, int(time.time()))
                 else:
-                    direction = "out"
-                    peer_ip = dst_ip
-                    bytes_up, bytes_down = bytes1, bytes2
-                # 尝试匹配 Xray pending
-                key = (src_ip, src_port, dst_port)
-                matched = None
-                with _xray_lock:
-                    if key in _xray_pending:
-                        matched = _xray_pending.pop(key)
-                if matched:
-                    _, _, _, _, xdst_ip, _, country, host, _, protocol = matched
-                    enqueue((ts, proto, direction, src_ip, src_port,
-                             xdst_ip or dst_ip, dst_port,
-                             bytes_up, bytes_down, country, host, protocol))
-                else:
-                    country = geoip(peer_ip)
-                    # 按 dst_port 判断协议（Hysteria2/Snell 等非 Xray 代理）
-                    protocol = PROTO_PORTS.get(dst_port if direction == "in" else src_port)
-                    # 非 Xray 流量，提交到有界线程池做 rDNS（最多 RDNS_WORKERS 个并发）
-                    def do_rdns(ts=ts, proto=proto, direction=direction,
-                                src_ip=src_ip, src_port=src_port, dst_ip=dst_ip, dst_port=dst_port,
-                                bytes_up=bytes_up, bytes_down=bytes_down, country=country,
-                                peer_ip=peer_ip, protocol=protocol):
-                        host = rdns_lookup(peer_ip)
-                        enqueue((ts, proto, direction, src_ip, src_port, dst_ip, dst_port,
-                                 bytes_up, bytes_down, country, host, protocol))
-                    _rdns_pool.submit(do_rdns)
+                    _, _, fts = active[key]
+                    active[key] = (bo, br, fts)   # 更新字节数
+
+            # 消失的连接
+            for key in list(active):
+                if key not in current:
+                    proto, src_ip, dst_ip, sport, dport = key
+                    bo, br, fts = active.pop(key)
+                    _handle_gone_conn(proto, src_ip, dst_ip, sport, dport, bo, br, fts)
+
         except Exception as e:
-            log.warning("conntrack_reader error: %s", e)
-            time.sleep(5)
+            log.warning("conntrack_poller error: %s", e)
+        time.sleep(POLL_INTERVAL)
 
 if __name__ == "__main__":
     init_db()
     log.info("VPS 流量采集器启动 (DB: %s)", DB_PATH)
-    threading.Thread(target=flush_writer, daemon=True).start()
-    threading.Thread(target=xray_log_reader, daemon=True).start()
-    threading.Thread(target=xray_pending_reaper, daemon=True).start()
-    conntrack_reader()  # 主线程跑 conntrack
+    threading.Thread(target=flush_writer,         daemon=True).start()
+    threading.Thread(target=xray_log_reader,      daemon=True).start()
+    threading.Thread(target=xray_pending_reaper,  daemon=True).start()
+    threading.Thread(target=conntrack_poller,     daemon=True).start()
+    # 主线程保活
+    while True:
+        time.sleep(60)
 PYEOF
 
     cat > /etc/systemd/system/vps-traffic-collector.service <<EOF
@@ -1881,7 +1915,7 @@ traffic_web_install() {
         echo -e "${RED}无法检测网络接口${NC}"; return
     fi
 
-    echo -e "\n${YELLOW}=== 安装 Web 流量面板 (V3.8) ===${NC}"
+    echo -e "\n${YELLOW}=== 安装 Web 流量面板 (V3.9) ===${NC}"
     echo -e "接口: ${CYAN}${iface}${NC}  配额: ${QUOTA_GB}GB  重置日: ${RESET_DAY}日"
     echo ""
 
@@ -2060,7 +2094,7 @@ manage_traffic_web_menu() {
 main_menu() {
     while true; do
         echo -e "\n${BLUE}=====================================${NC}"
-        echo -e "   全能协议管理脚本 V3.8"
+        echo -e "   全能协议管理脚本 V3.9"
         echo -e "${BLUE}=====================================${NC}"
         echo -e "1. 安装/重置 Reality (TCP 443)  [$(check_status xray)]"
         echo -e "2. 安装/重置 Hysteria2 (UDP 443)[$(check_status hysteria-server)]"
